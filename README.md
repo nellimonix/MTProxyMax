@@ -500,43 +500,20 @@ mtproxymax telegram remove              # Remove bot completely
 
 ## 📋 Changelog
 
-### v1.0.0 — Engine v3.0.15
+### v1.0.0 — Engine v3.1.2
 
-**Engine Upgrade (v3.0.7 → v3.0.15):**
+**Engine Upgrade (v3.0.15 → v3.1.2):**
 
-- **ME Connection Hardening** — Better error handling and recovery for lost middle-end connections
-- **Secure Payload Fixes** — Payload length validation and ME protocol hardening
-- **Bounded Backpressure** — Semaphore-based global gate prevents overload, ME buffer reuse for efficiency
-- **TLS Full Certificate** — New TLS fetcher drafts real certificates in ServerHello, with TTL-based refresh
-- **ME Pool Reinit** — Soft-staged reinit without reconcile, plus reinit polishing for smoother reconnects
-- **Desync Forensics** — Full forensics for desync detection and debugging
-- **ME Pool Hardswap** — Hard connection swap with softer fallback for graceful pool rotation
-- **ME Pool Health + Rotation** — Active health checking with automatic rotation of unhealthy connections
-
-### v1.0.0 — Engine v3.0.7 + Custom IP
-
-**Engine Upgrade (v3.0.4 → v3.0.7):**
-
-- **Fake TLS V2** — Complete rewrite of the TLS front. Handshakes now mirror real TLS 1.3 sessions with per-domain profiles, dynamic certificate lengths, and realistic record fragmentation. Significantly harder to fingerprint via DPI
-- **ME Pool V2** — Middle-end connections now use keepalive padding frames, staggered warmup, and exponential backoff reconnects for better stability under load
-- **Dynamic config reload** — Engine picks up config.toml changes without a restart
-- **SOCKS proxy hostname support** — Upstream SOCKS4/SOCKS5 proxies now accept hostnames in addition to IPs
-- **Frame size fixes** — Resolved "frame too large" errors on middle-end connections
-- **Extended handshake timeout** — `client_handshake` raised from 15s to 30s for slow networks
-
-**New Features:**
-
-- **Custom IP** — Set a custom IP for proxy links when behind NAT, CDN, or multi-IP setups. The proxy still binds to all interfaces — this only affects link/QR generation
-  ```bash
-  mtproxymax ip 203.0.113.50    # Set custom IP
-  mtproxymax ip auto             # Reset to auto-detect
-  ```
-  Also available in the setup wizard and TUI settings menu
-
-**Performance:**
-
-- **LTO builds** — Engine compiled with Link-Time Optimization (`LTO=true`, `codegen-units=1`) for ~10-20% faster throughput
-- **No default resource caps** — Docker CPU/memory limits now default to unlimited instead of 1 core / 256MB
+- **Parallel STUN Queries** — STUN subsystem now queries multiple servers in parallel for faster NAT detection
+- **Async ME Pool Init** — Middle-end pools created asynchronously and in parallel, faster startup and recovery
+- **Dead Writer Cleanup** — ME writers in dead state removed immediately, no more lingering connections or deadlocks
+- **Pool Validation** — Strict ME pool validation before accepting client connections, prevents failed handshakes
+- **Pool Observer** — New flap-detection in statistics monitors pool stability
+- **TLS-F Optimization** — TLS fingerprint fetching optimized
+- **ME Probe Parallelized** — Health checks run concurrently instead of serially
+- **Built-in Defaults** — Sensible defaults baked in, `tls_emulation` enabled by default, minimal config needed
+- **Detected IP in Links** — Log output now shows correct detected IP in proxy links
+- **PROXY Protocol Masking** — New `mask_proxy_protocol` option for PROXY protocol support
 
 ### v1.0.0 — Per-User Limits + Telegram Bot
 

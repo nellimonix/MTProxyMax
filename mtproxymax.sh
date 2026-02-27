@@ -22,8 +22,8 @@ UPSTREAMS_FILE="${INSTALL_DIR}/upstreams.conf"
 BACKUP_DIR="${INSTALL_DIR}/backups"
 CONTAINER_NAME="mtproxymax"
 DOCKER_IMAGE_BASE="mtproxymax-telemt"
-TELEMT_MIN_VERSION="3.0.15"
-TELEMT_COMMIT="ad1940b"  # Pinned: v3.0.15 — ME Pool Health/Rotation, TLS cert TTL, desync forensics
+TELEMT_MIN_VERSION="3.1.2"
+TELEMT_COMMIT="6d6cd30"  # Pinned: v3.1.2 — Parallel STUN/ME pools, dead writer cleanup, pool validation, defaults
 GITHUB_REPO="SamNet-dev/MTProxyMax"
 REGISTRY_IMAGE="ghcr.io/samnet-dev/mtproxymax-telemt"
 
