@@ -500,18 +500,17 @@ mtproxymax telegram remove              # Remove bot completely
 
 ## 📋 Changelog
 
-### v1.0.0 — Engine v3.3.3 LTS
+### v1.0.0 — Engine v3.3.14
 
-**Engine Upgrade (v3.1.6 → v3.3.3 LTS):**
+**Engine Upgrade (v3.3.3 → v3.3.14):**
 
-- **ME NoWait Routing** — Connections no longer block waiting for writers, reducing latency spikes under churn
-- **Async Recovery Failfast** — New send path with async recovery instead of inline blocking, fewer stalls under load
-- **Atomic Secret Snapshots** — Lock-free secret reads on every connection for higher throughput at scale
-- **HybridAsyncPersistent** — New ME route mode keeps routing even when writers are temporarily unavailable
-- **Upstream Connection Budget** — Limits concurrent upstream connection attempts, prevents connection storms
-- **IP Limit Rework** — New IP tracking system with unique IP always in metrics
-- **ME Pool Init Fixes** — More reliable pool initialization with retry logic
-- **ME-to-DC Fallback** — Graceful fallback when preferred DC method is unavailable
+- **Event-Driven ME** — Pool switches from busy-polling to event-driven, reducing CPU usage on idle/low-traffic servers
+- **CPU/RAM Hot-Path Optimization** — Removed hot-path obstacles for lower resource usage under load
+- **ME Writer Selection** — Smarter active-by-endpoint writer picking for better DC routing
+- **DC-to-Client Tuning** — Fine-tuned data path from datacenter to client connections
+- **ME/DC Reroute** — Dynamic rerouting when preferred datacenter path degrades
+- **Adaptive Floor Planner** — Smarter idle writer management with upper-limit caps
+- **PROXY Real IP in Logs** — Real client IP now visible in PROXY protocol logs
 
 ### v1.0.0 — Per-User Limits + Telegram Bot
 
