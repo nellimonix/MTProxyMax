@@ -5,7 +5,7 @@
     One script. Full control. Zero hassle.
   </p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-1.0.0-brightgreen" alt="Version"/>
+    <img src="https://img.shields.io/badge/version-1.0.1-brightgreen" alt="Version"/>
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/>
     <img src="https://img.shields.io/badge/engine-Rust_(telemt_3.x)-orange" alt="Engine"/>
     <img src="https://img.shields.io/badge/platform-Linux-lightgrey" alt="Platform"/>
@@ -499,6 +499,13 @@ mtproxymax telegram remove              # Remove bot completely
 ---
 
 ## 📋 Changelog
+
+### v1.0.1 — Batch Secret Management
+
+- **Batch Add** — `secret add-batch <l1> <l2> ...` adds multiple secrets with a single restart
+- **Batch Remove** — `secret remove-batch <l1> <l2> ...` removes multiple secrets with a single restart
+- **`--no-restart` flag** — `secret add/remove --no-restart` for scripting and automation
+- **TUI options** — Interactive menu options [6] and [7] for batch operations
 
 ### v1.0.0 — Engine v3.3.14
 

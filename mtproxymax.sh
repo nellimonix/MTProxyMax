@@ -11,7 +11,7 @@ set -eo pipefail
 export LC_NUMERIC=C
 
 # ── Section 1: Initialization ────────────────────────────────
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCRIPT_NAME="mtproxymax"
 INSTALL_DIR="/opt/mtproxymax"
 CONFIG_DIR="${INSTALL_DIR}/mtproxy"
@@ -1278,7 +1278,7 @@ get_user_stats() {
 
 # Add a new secret
 secret_add() {
-    local label="$1" custom_secret="${2:-}"
+    local label="$1" custom_secret="${2:-}" no_restart="${3:-false}"
 
     # Validate label
     if [ -z "$label" ]; then
@@ -1330,7 +1330,7 @@ secret_add() {
     save_secrets
 
     # Restart if running (run_proxy_container regenerates config)
-    if is_proxy_running; then
+    if [ "$no_restart" != "true" ] && is_proxy_running; then
         restart_proxy_container
     fi
 
@@ -1351,7 +1351,7 @@ secret_add() {
 
 # Remove a secret
 secret_remove() {
-    local label="$1" force="${2:-false}"
+    local label="$1" force="${2:-false}" no_restart="${3:-false}"
 
     local idx=-1
     local i
@@ -1411,11 +1411,91 @@ secret_remove() {
 
     save_secrets
 
-    if is_proxy_running; then
+    if [ "$no_restart" != "true" ] && is_proxy_running; then
         restart_proxy_container
     fi
 
     log_success "Secret '${label}' removed"
+}
+
+# Batch add multiple secrets (single restart)
+secret_add_batch() {
+    local labels=("$@")
+
+    if [ ${#labels[@]} -eq 0 ]; then
+        log_error "Usage: mtproxymax secret add-batch <label1> <label2> ..."
+        return 1
+    fi
+
+    local added=0 failed=0
+    for label in "${labels[@]}"; do
+        if secret_add "$label" "" "true"; then
+            added=$((added + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    # Single restart after all additions
+    if [ $added -gt 0 ] && is_proxy_running; then
+        restart_proxy_container
+    fi
+
+    echo ""
+    log_success "Batch complete: ${added} added, ${failed} failed"
+}
+
+# Batch remove multiple secrets (single restart)
+secret_remove_batch() {
+    local force="${1:-false}"
+    shift 2>/dev/null || true
+    local labels=("$@")
+
+    if [ ${#labels[@]} -eq 0 ]; then
+        log_error "Usage: mtproxymax secret remove-batch <label1> <label2> ..."
+        return 1
+    fi
+
+    # Count how many of the requested labels actually exist
+    local match_count=0
+    local l i
+    for l in "${labels[@]}"; do
+        for i in "${!SECRETS_LABELS[@]}"; do
+            [ "${SECRETS_LABELS[$i]}" = "$l" ] && { match_count=$((match_count + 1)); break; }
+        done
+    done
+
+    if [ $match_count -ge ${#SECRETS_LABELS[@]} ]; then
+        log_error "Cannot remove all secrets — proxy needs at least one"
+        return 1
+    fi
+
+    # Confirm unless forced
+    if [ "$force" != "true" ] && [ -t 0 ]; then
+        echo -e "  ${YELLOW}Remove ${#labels[@]} secrets? Users with these keys will be disconnected.${NC}"
+        echo -e "  ${DIM}Labels: ${labels[*]}${NC}"
+        echo -en "  ${BOLD}Type 'yes' to confirm:${NC} "
+        local confirm
+        read -r confirm
+        [ "$confirm" != "yes" ] && { log_info "Cancelled"; return 0; }
+    fi
+
+    local removed=0 failed=0
+    for l in "${labels[@]}"; do
+        if secret_remove "$l" "true" "true"; then
+            removed=$((removed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    # Single restart after all removals
+    if [ $removed -gt 0 ] && is_proxy_running; then
+        restart_proxy_container
+    fi
+
+    echo ""
+    log_success "Batch complete: ${removed} removed, ${failed} failed"
 }
 
 # List all secrets
@@ -3906,7 +3986,9 @@ show_cli_help() {
     echo ""
     echo -e "  ${BOLD}Secret Management:${NC}"
     echo -e "    ${GREEN}secret add${NC} <label>      Add a new secret"
+    echo -e "    ${GREEN}secret add-batch${NC} <l1> <l2> ...  Add multiple secrets (single restart)"
     echo -e "    ${GREEN}secret remove${NC} <label>   Remove a secret"
+    echo -e "    ${GREEN}secret remove-batch${NC} <l1> <l2> ...  Remove multiple secrets (single restart)"
     echo -e "    ${GREEN}secret list${NC}             List all secrets"
     echo -e "    ${GREEN}secret rotate${NC} <label>   Rotate a secret"
     echo -e "    ${GREEN}secret link${NC} [label]     Show proxy link"
@@ -3916,6 +3998,7 @@ show_cli_help() {
     echo -e "    ${GREEN}secret limits${NC} [label]   Show user limits"
     echo -e "    ${GREEN}secret setlimit${NC} <label> conns|ips|quota|expires <value>"
     echo -e "    ${GREEN}secret setlimits${NC} <label> <conns> <ips> <quota> [expires]"
+    echo -e "    ${DIM}Tip: add/remove support --no-restart flag for scripting${NC}"
     echo ""
     echo -e "  ${BOLD}Upstream Routing:${NC}"
     echo -e "    ${GREEN}upstream list${NC}                  List upstreams"
@@ -4058,8 +4141,26 @@ cli_main() {
             local subcmd="${1:-list}"
             shift 2>/dev/null || true
             case "$subcmd" in
-                add)     check_root; secret_add "$1" "${2:-}" ;;
-                remove)  check_root; secret_remove "$1" ;;
+                add)
+                    check_root
+                    local _no_restart="false"
+                    [[ "${*}" == *"--no-restart"* ]] && _no_restart="true"
+                    local _args=()
+                    for _a in "$@"; do [[ "$_a" != "--no-restart" ]] && _args+=("$_a"); done
+                    secret_add "${_args[0]:-}" "${_args[1]:-}" "$_no_restart"
+                    ;;
+                add-batch)
+                    check_root; secret_add_batch "$@" ;;
+                remove)
+                    check_root
+                    local _no_restart="false"
+                    [[ "${*}" == *"--no-restart"* ]] && _no_restart="true"
+                    local _args=()
+                    for _a in "$@"; do [[ "$_a" != "--no-restart" ]] && _args+=("$_a"); done
+                    secret_remove "${_args[0]:-}" "false" "$_no_restart"
+                    ;;
+                remove-batch)
+                    check_root; secret_remove_batch "false" "$@" ;;
                 list)    secret_list ;;
                 rotate)  check_root; secret_rotate "$1" ;;
                 link)    get_proxy_link_https "${1:-}"; echo "" ;;
@@ -4726,6 +4827,8 @@ show_secrets_menu() {
         echo -e "  ${DIM}[3]${NC} Rotate a secret"
         echo -e "  ${DIM}[4]${NC} Enable/disable a secret"
         echo -e "  ${DIM}[5]${NC} Set user limits"
+        echo -e "  ${DIM}[6]${NC} Batch add secrets"
+        echo -e "  ${DIM}[7]${NC} Batch remove secrets"
         echo -e "  ${DIM}[0]${NC} Back"
 
         local choice
@@ -4775,6 +4878,28 @@ show_secrets_menu() {
                     echo -en "  ${BOLD}Expiry date (YYYY-MM-DD, 0=never):${NC} "
                     local ex; read -r ex
                     secret_set_limits "$label" "${mc:-0}" "${mi:-0}" "${dq:-0}" "${ex:-0}" || true
+                fi
+                press_any_key
+                ;;
+            6)
+                echo -e "  ${DIM}Enter labels separated by spaces${NC}"
+                echo -en "  ${BOLD}Labels:${NC} "
+                local batch_labels
+                read -r batch_labels
+                if [ -n "$batch_labels" ]; then
+                    # shellcheck disable=SC2086
+                    secret_add_batch $batch_labels || true
+                fi
+                press_any_key
+                ;;
+            7)
+                echo -e "  ${DIM}Enter labels separated by spaces${NC}"
+                echo -en "  ${BOLD}Labels to remove:${NC} "
+                local batch_labels
+                read -r batch_labels
+                if [ -n "$batch_labels" ]; then
+                    # shellcheck disable=SC2086
+                    secret_remove_batch "false" $batch_labels || true
                 fi
                 press_any_key
                 ;;
@@ -5239,7 +5364,9 @@ show_info_multisecret() {
     echo ""
     echo -e "  ${BOLD}Commands:${NC}"
     echo -e "  ${GREEN}mtproxymax secret add <label>${NC}      Create a new secret"
+    echo -e "  ${GREEN}mtproxymax secret add-batch <l1> <l2> ...${NC}  Add multiple (single restart)"
     echo -e "  ${GREEN}mtproxymax secret remove <label>${NC}   Delete a secret"
+    echo -e "  ${GREEN}mtproxymax secret remove-batch <l1> <l2> ...${NC}  Remove multiple (single restart)"
     echo -e "  ${GREEN}mtproxymax secret rotate <label>${NC}   Replace key, keep label"
     echo -e "  ${GREEN}mtproxymax secret enable <label>${NC}   Re-enable a disabled secret"
     echo -e "  ${GREEN}mtproxymax secret disable <label>${NC}  Temporarily disable access"
