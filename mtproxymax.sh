@@ -1397,20 +1397,26 @@ _load_all_cumulative_user_stats() {
             _batch_cum_out["$_l"]=$(( ${_saved_out["$_l"]:-0} + doo ))
             _batch_cum_conns["$_l"]=${_lc:-0}
         done < <(echo "$_m" | awk '
+            function get_user(s,   p,q) {
+                p = index(s, "user=\"")
+                if (!p) return ""
+                s = substr(s, p + 6)
+                q = index(s, "\"")
+                return q ? substr(s, 1, q - 1) : ""
+            }
             /^telemt_user_octets_from_client\{/ {
-                match($0, /user="([^"]+)"/, m); users_in[m[1]] += $NF
+                u = get_user($0); if (u) users_in[u] += $NF
             }
             /^telemt_user_octets_to_client\{/ {
-                match($0, /user="([^"]+)"/, m); users_out[m[1]] += $NF
+                u = get_user($0); if (u) users_out[u] += $NF
             }
             /^telemt_user_connections_current\{/ {
-                match($0, /user="([^"]+)"/, m); users_conns[m[1]] += $NF
+                u = get_user($0); if (u) users_conns[u] += $NF
             }
             END {
                 for (u in users_in) {
                     printf "%s|%.0f|%.0f|%.0f\n", u, users_in[u]+0, users_out[u]+0, users_conns[u]+0
                 }
-                # Users with only out/conns but no in
                 for (u in users_out) {
                     if (!(u in users_in)) printf "%s|0|%.0f|%.0f\n", u, users_out[u]+0, users_conns[u]+0
                 }
