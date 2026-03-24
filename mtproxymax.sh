@@ -11,7 +11,7 @@ set -eo pipefail
 export LC_NUMERIC=C
 
 # ── Section 1: Initialization ────────────────────────────────
-VERSION="1.0.2"
+VERSION="1.0.3"
 SCRIPT_NAME="mtproxymax"
 INSTALL_DIR="/opt/mtproxymax"
 CONFIG_DIR="${INSTALL_DIR}/mtproxy"
@@ -20,6 +20,8 @@ SECRETS_FILE="${INSTALL_DIR}/secrets.conf"
 STATS_DIR="${INSTALL_DIR}/relay_stats"
 UPSTREAMS_FILE="${INSTALL_DIR}/upstreams.conf"
 BACKUP_DIR="${INSTALL_DIR}/backups"
+CONNECTION_LOG="${INSTALL_DIR}/connection.log"
+INSTANCES_FILE="${INSTALL_DIR}/instances.conf"
 CONTAINER_NAME="mtproxymax"
 DOCKER_IMAGE_BASE="mtproxymax-telemt"
 TELEMT_MIN_VERSION="3.3.28"
@@ -651,13 +653,13 @@ save_secrets() {
     tmp=$(_mktemp) || { log_error "Cannot create temp file"; return 1; }
 
     echo "# MTProxyMax Secrets Database — v${VERSION}" > "$tmp"
-    echo "# Format: LABEL|SECRET|CREATED_TS|ENABLED|MAX_CONNS|MAX_IPS|QUOTA_BYTES|EXPIRES" >> "$tmp"
+    echo "# Format: LABEL|SECRET|CREATED_TS|ENABLED|MAX_CONNS|MAX_IPS|QUOTA_BYTES|EXPIRES|NOTES" >> "$tmp"
     echo "# DO NOT EDIT MANUALLY — use 'mtproxymax secret' commands" >> "$tmp"
 
     if [ ${#SECRETS_LABELS[@]} -gt 0 ]; then
         local i
         for i in "${!SECRETS_LABELS[@]}"; do
-            echo "${SECRETS_LABELS[$i]}|${SECRETS_KEYS[$i]}|${SECRETS_CREATED[$i]}|${SECRETS_ENABLED[$i]}|${SECRETS_MAX_CONNS[$i]:-0}|${SECRETS_MAX_IPS[$i]:-0}|${SECRETS_QUOTA[$i]:-0}|${SECRETS_EXPIRES[$i]:-0}" >> "$tmp"
+            echo "${SECRETS_LABELS[$i]}|${SECRETS_KEYS[$i]}|${SECRETS_CREATED[$i]}|${SECRETS_ENABLED[$i]}|${SECRETS_MAX_CONNS[$i]:-0}|${SECRETS_MAX_IPS[$i]:-0}|${SECRETS_QUOTA[$i]:-0}|${SECRETS_EXPIRES[$i]:-0}|${SECRETS_NOTES[$i]:-}" >> "$tmp"
         done
     fi
 
@@ -674,6 +676,7 @@ declare -a SECRETS_MAX_CONNS=()
 declare -a SECRETS_MAX_IPS=()
 declare -a SECRETS_QUOTA=()
 declare -a SECRETS_EXPIRES=()
+declare -a SECRETS_NOTES=()
 
 # Load secrets database
 load_secrets() {
@@ -685,9 +688,10 @@ load_secrets() {
     SECRETS_MAX_IPS=()
     SECRETS_QUOTA=()
     SECRETS_EXPIRES=()
+    SECRETS_NOTES=()
 
     if [ -f "$SECRETS_FILE" ]; then
-        while IFS='|' read -r label secret created enabled max_conns max_ips quota expires; do
+        while IFS='|' read -r label secret created enabled max_conns max_ips quota expires notes; do
             [[ "$label" =~ ^[[:space:]]*# ]] && continue
             [[ "$label" =~ ^[[:space:]]*$ ]] && continue
             [ -z "$secret" ] && continue
@@ -716,6 +720,7 @@ load_secrets() {
                 _ex="0"
             fi
             SECRETS_EXPIRES+=("$_ex")
+            SECRETS_NOTES+=("${notes:-}")
         done < "$SECRETS_FILE"
     fi
 
@@ -1523,7 +1528,7 @@ flush_traffic_to_disk() {
     cum_out=$((cum_out + gd_out))
 
     # Per-user traffic delta
-    [ -f "$SECRETS_FILE" ] && while IFS='|' read -r label secret created enabled _mc _mi _q _ex; do
+    [ -f "$SECRETS_FILE" ] && while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
         [[ "$label" =~ ^# ]] && continue; [ -z "$secret" ] && continue
         [ "$enabled" != "true" ] && continue
         local ui uo
@@ -1622,6 +1627,7 @@ secret_add() {
     SECRETS_MAX_IPS+=("0")
     SECRETS_QUOTA+=("0")
     SECRETS_EXPIRES+=("0")
+    SECRETS_NOTES+=("")
 
     # Save
     save_secrets
@@ -1685,7 +1691,7 @@ secret_remove() {
 
     # Remove from arrays (rebuild without the index)
     local -a new_labels=() new_keys=() new_created=() new_enabled=()
-    local -a new_max_conns=() new_max_ips=() new_quota=() new_expires=()
+    local -a new_max_conns=() new_max_ips=() new_quota=() new_expires=() new_notes=()
     for i in "${!SECRETS_LABELS[@]}"; do
         [ "$i" -eq "$idx" ] && continue
         new_labels+=("${SECRETS_LABELS[$i]}")
@@ -1696,6 +1702,7 @@ secret_remove() {
         new_max_ips+=("${SECRETS_MAX_IPS[$i]:-0}")
         new_quota+=("${SECRETS_QUOTA[$i]:-0}")
         new_expires+=("${SECRETS_EXPIRES[$i]:-0}")
+        new_notes+=("${SECRETS_NOTES[$i]:-}")
     done
     SECRETS_LABELS=("${new_labels[@]}")
     SECRETS_KEYS=("${new_keys[@]}")
@@ -1705,6 +1712,7 @@ secret_remove() {
     SECRETS_MAX_IPS=("${new_max_ips[@]}")
     SECRETS_QUOTA=("${new_quota[@]}")
     SECRETS_EXPIRES=("${new_expires[@]}")
+    SECRETS_NOTES=("${new_notes[@]}")
 
     save_secrets
 
@@ -1835,8 +1843,37 @@ secret_list() {
             status_icon="${GREEN}${SYM_OK}${NC}"
             status_text="${GREEN}active${NC}"
         else
-            status_icon="${RED}${SYM_OK}${NC}"
-            status_text="${RED}disabled${NC}"
+            # Check if disabled due to quota
+            local _quota="${SECRETS_QUOTA[$i]:-0}"
+            local _total_usage=$(( ${_batch_cum_in["$label"]:-0} + ${_batch_cum_out["$label"]:-0} ))
+            if [ "$_quota" -gt 0 ] 2>/dev/null && [ "$_total_usage" -ge "$_quota" ] 2>/dev/null; then
+                status_icon="${RED}${SYM_OK}${NC}"
+                status_text="${RED}quota hit${NC}"
+            else
+                status_icon="${RED}${SYM_OK}${NC}"
+                status_text="${RED}disabled${NC}"
+            fi
+        fi
+
+        # Expiry warning
+        local expiry_info=""
+        local _exp="${SECRETS_EXPIRES[$i]}"
+        if [ "$_exp" != "0" ] && [ -n "$_exp" ]; then
+            local exp_epoch _exp_full="$_exp"
+            [[ "$_exp_full" == *T* ]] || _exp_full="${_exp_full}T23:59:59Z"
+            exp_epoch=$(_iso_to_epoch "$_exp_full" 2>/dev/null) || exp_epoch=0
+            if [ "$exp_epoch" -gt 0 ]; then
+                local now_epoch days_left
+                now_epoch=$(date +%s)
+                days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+                if [ "$days_left" -lt 0 ]; then
+                    expiry_info=" ${RED}(expired)${NC}"
+                elif [ "$days_left" -le 3 ]; then
+                    expiry_info=" ${YELLOW}(${days_left}d left)${NC}"
+                elif [ "$days_left" -le 7 ]; then
+                    expiry_info=" ${DIM}(${days_left}d left)${NC}"
+                fi
+            fi
         fi
 
         # Format creation date (use printf builtin when available, fallback to date)
@@ -1851,8 +1888,12 @@ secret_list() {
         traffic_in_fmt=$(format_bytes "$u_in")
         traffic_out_fmt=$(format_bytes "$u_out")
 
-        printf "  %-4s %-16s ${status_icon} %-8b %-10s %-12s %-12s\n" \
+        printf "  %-4s %-16s ${status_icon} %-8b %-10s %-12s %-12s" \
             "$((i+1))" "$label" "$status_text" "$created_fmt" "$traffic_in_fmt" "$traffic_out_fmt"
+        echo -e "${expiry_info}"
+
+        # Show note if present
+        [ -n "${SECRETS_NOTES[$i]:-}" ] && echo -e "       ${DIM}📝 ${SECRETS_NOTES[$i]}${NC}"
     done
     echo ""
 }
@@ -2055,6 +2096,80 @@ secret_set_limits() {
 
     log_success "Limits updated for '${label}'"
     secret_show_limits "$label"
+}
+
+# Edit note/description for a secret
+secret_edit_note() {
+    local label="$1" note="${2:-}"
+
+    local idx=-1 i
+    for i in "${!SECRETS_LABELS[@]}"; do
+        if [ "${SECRETS_LABELS[$i]}" = "$label" ]; then idx=$i; break; fi
+    done
+    [ "$idx" = "-1" ] && { log_error "Secret '${label}' not found"; return 1; }
+
+    # Interactive prompt if no note provided
+    if [ -z "$note" ]; then
+        echo -e "  ${DIM}Current note: ${SECRETS_NOTES[$idx]:-${DIM}(none)${NC}}${NC}"
+        echo -en "  ${BOLD}New note (empty to clear):${NC} "
+        read -r note
+    fi
+
+    # Validate: no pipe characters or newlines
+    if [[ "$note" == *"|"* ]]; then
+        log_error "Notes cannot contain the pipe character (|)"
+        return 1
+    fi
+
+    SECRETS_NOTES[$idx]="$note"
+    save_secrets
+    if [ -n "$note" ]; then
+        log_success "Note set for '${label}': ${note}"
+    else
+        log_success "Note cleared for '${label}'"
+    fi
+}
+
+# Re-enable a quota-exceeded secret with optional traffic reset
+secret_reenable() {
+    local label="$1"
+
+    local idx=-1 i
+    for i in "${!SECRETS_LABELS[@]}"; do
+        if [ "${SECRETS_LABELS[$i]}" = "$label" ]; then idx=$i; break; fi
+    done
+    [ "$idx" = "-1" ] && { log_error "Secret '${label}' not found"; return 1; }
+
+    if [ "${SECRETS_ENABLED[$idx]}" = "true" ]; then
+        log_info "Secret '${label}' is already enabled"
+        return 0
+    fi
+
+    # Re-enable
+    SECRETS_ENABLED[$idx]="true"
+    save_secrets
+
+    # Offer quota reset
+    local _quota="${SECRETS_QUOTA[$idx]:-0}"
+    if [ "$_quota" -gt 0 ] 2>/dev/null; then
+        echo -en "  ${BOLD}Reset traffic counter for quota? [y/N]:${NC} "
+        local _ans; read -r _ans
+        if [[ "$_ans" =~ ^[yY] ]]; then
+            # Zero the cumulative traffic for this user
+            local _ut="${STATS_DIR}/user_traffic"
+            if [ -f "$_ut" ]; then
+                grep -v "^${label}|" "$_ut" > "${_ut}.tmp" 2>/dev/null || true
+                mv "${_ut}.tmp" "$_ut" 2>/dev/null || true
+            fi
+            # Clear quota alert tracking
+            local _qa="${STATS_DIR}/.quota_alerts_sent"
+            [ -f "$_qa" ] && { grep -v "^${label}|" "$_qa" > "${_qa}.tmp" 2>/dev/null; mv "${_qa}.tmp" "$_qa" 2>/dev/null; } || true
+            log_success "Traffic counter reset for '${label}'"
+        fi
+    fi
+
+    reload_proxy_config
+    log_success "Secret '${label}' re-enabled"
 }
 
 # Show limits for a secret
@@ -2533,6 +2648,37 @@ stop_proxy_container() {
     else
         log_info "Proxy is not running"
     fi
+    # Also stop secondary instances
+    _stop_all_instances 2>/dev/null
+}
+
+_stop_all_instances() {
+    [ -f "$INSTANCES_FILE" ] || return 0
+    load_instances 2>/dev/null
+    local i
+    for i in "${!INSTANCE_PORTS[@]}"; do
+        docker stop --timeout 10 "mtproxymax-${INSTANCE_PORTS[$i]}" &>/dev/null || true
+    done
+}
+
+_start_all_instances() {
+    [ -f "$INSTANCES_FILE" ] || return 0
+    load_instances 2>/dev/null
+    local i
+    for i in "${!INSTANCE_PORTS[@]}"; do
+        [ "${INSTANCE_ENABLED[$i]}" = "true" ] || continue
+        local cname="mtproxymax-${INSTANCE_PORTS[$i]}"
+        docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$" && continue
+        # Regenerate instance config
+        local inst_config="${CONFIG_DIR}/config-${INSTANCE_PORTS[$i]}.toml"
+        if [ -f "$inst_config" ]; then
+            docker rm -f "$cname" &>/dev/null || true
+            docker run -d --name "$cname" --restart unless-stopped --network host \
+                --ulimit nofile=65535:65535 --log-opt max-size=10m --log-opt max-file=3 \
+                -v "${inst_config}:/etc/telemt.toml:ro" \
+                "$(get_docker_image)" /etc/telemt.toml &>/dev/null
+        fi
+    done
 }
 
 start_proxy_container() {
@@ -2544,12 +2690,15 @@ start_proxy_container() {
     # Always recreate container to ensure settings (port, memory, cpus) are current
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
     run_proxy_container
+    # Also start secondary instances
+    _start_all_instances 2>/dev/null
 }
 
 restart_proxy_container() {
     stop_proxy_container 2>/dev/null || true
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
     run_proxy_container
+    _start_all_instances 2>/dev/null
 }
 
 # Hot-reload: rewrite config.toml and let the engine pick it up (no restart, no dropped connections)
@@ -2559,6 +2708,25 @@ reload_proxy_config() {
         return 0
     fi
     generate_telemt_config || { log_error "Config generation failed"; return 1; }
+
+    # Also reload secondary instances if any
+    if [ -f "$INSTANCES_FILE" ]; then
+        load_instances 2>/dev/null
+        local i _orig_port="$PROXY_PORT" _orig_mport="$PROXY_METRICS_PORT"
+        for i in "${!INSTANCE_PORTS[@]}"; do
+            [ "${INSTANCE_ENABLED[$i]}" = "true" ] || continue
+            local inst_config="${CONFIG_DIR}/config-${INSTANCE_PORTS[$i]}.toml"
+            PROXY_PORT="${INSTANCE_PORTS[$i]}"
+            PROXY_METRICS_PORT="${INSTANCE_METRICS_PORTS[$i]}"
+            generate_telemt_config
+            mv "${CONFIG_DIR}/config.toml" "$inst_config" 2>/dev/null
+        done
+        PROXY_PORT="$_orig_port"
+        PROXY_METRICS_PORT="$_orig_mport"
+        # Regenerate primary config (was overwritten by last instance)
+        generate_telemt_config
+    fi
+
     log_info "Config reloaded (hot-reload, no restart)"
 }
 
@@ -2759,6 +2927,22 @@ geoblock_reapply_all() {
 
     # Whitelist mode: add default DROP for proxy port at the end (after all ACCEPTs)
     _ensure_default_drop
+
+    # Apply same rules to secondary instance ports
+    if [ -f "$INSTANCES_FILE" ]; then
+        load_instances 2>/dev/null
+        local _orig_port="$PROXY_PORT" i
+        for i in "${!INSTANCE_PORTS[@]}"; do
+            [ "${INSTANCE_ENABLED[$i]}" = "true" ] || continue
+            PROXY_PORT="${INSTANCE_PORTS[$i]}"
+            for code in "${codes[@]}"; do
+                [ -z "$code" ] && continue
+                [ -f "${GEOBLOCK_CACHE_DIR}/${code}.zone" ] && _apply_country_rules "$code" &>/dev/null || true
+            done
+            _ensure_default_drop
+        done
+        PROXY_PORT="$_orig_port"
+    fi
 }
 
 # Remove ALL mtproxymax geoblock rules (called on uninstall)
@@ -3576,7 +3760,7 @@ update_traffic() {
     _prev_total_out=$cur_out
 
     # Per-user delta tracking (reuse already-fetched metrics)
-    while IFS='|' read -r label secret created enabled _mc _mi _q _ex; do
+    while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
         [[ "$label" =~ ^# ]] && continue; [ -z "$secret" ] && continue
         [ "$enabled" != "true" ] && continue
         local ui=0 uo=0 _uc=0
@@ -3670,7 +3854,7 @@ _process_cmd() {
             local msg="📋 *Secrets*\n\n"
             local _sec_metrics
             _sec_metrics=$(curl -s --max-time 2 "http://127.0.0.1:${PROXY_METRICS_PORT:-9090}/metrics" 2>/dev/null)
-            while IFS='|' read -r label secret created enabled _mc _mi _q _ex; do
+            while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
                 [[ "$label" =~ ^# ]] && continue
                 [ -z "$secret" ] && continue
                 local icon="🟢"; [ "$enabled" != "true" ] && icon="🔴"
@@ -3689,7 +3873,7 @@ _process_cmd() {
             [ -z "$ip" ] && tg_send "❌ Cannot detect server IP" && return
             local msg="🔗 *Proxy Details*\n\n"
             local _first_fs=""
-            while IFS='|' read -r label secret created enabled _mc _mi _q _ex; do
+            while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
                 [[ "$label" =~ ^# ]] && continue
                 [ -z "$secret" ] && continue
                 [ "$enabled" != "true" ] && continue
@@ -3807,7 +3991,7 @@ _process_cmd() {
             local msg="📊 *Traffic Report*\n\n"
             msg+="Total: ↓ $(format_bytes $ct_in) ↑ $(format_bytes $ct_out)\n"
             msg+="Active connections: ${conns}\n\n"
-            while IFS='|' read -r label secret created enabled _mc _mi _q _ex; do
+            while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
                 [[ "$label" =~ ^# ]] && continue; [ -z "$secret" ] && continue
                 [ "$enabled" != "true" ] && continue
                 local cum_u=$(get_cum_user_traffic "$label")
@@ -3831,7 +4015,7 @@ _process_cmd() {
             load_tg_settings
             [ ! -f "$SECRETS_FILE" ] && tg_send "📋 No secrets configured." && return
             local msg="📋 *User Limits*\n\n"
-            while IFS='|' read -r label secret created enabled max_conns max_ips quota expires; do
+            while IFS='|' read -r label secret created enabled max_conns max_ips quota expires _notes; do
                 [[ "$label" =~ ^# ]] && continue
                 [ -z "$secret" ] && continue
                 max_conns=${max_conns:-0}; max_ips=${max_ips:-0}; quota=${quota:-0}; expires=${expires:-0}
@@ -3899,6 +4083,9 @@ _last_report=0
 _report_interval=$(( ${TELEGRAM_INTERVAL:-6} * 3600 ))
 _last_health=0
 _last_traffic_update=0
+_last_enforcement=0
+declare -A _prev_log_in=()
+declare -A _prev_log_out=()
 
 while true; do
     load_tg_settings
@@ -3908,6 +4095,85 @@ while true; do
     if [ $((_now - _last_traffic_update)) -ge 60 ] && is_running; then
         _last_traffic_update=$_now
         update_traffic 2>/dev/null
+
+        # Connection log: append per-user activity (delta = current cumulative - previous cumulative)
+        _connlog="${INSTALL_DIR}/connection.log"
+        _ts=$(date '+%Y-%m-%d %H:%M')
+        [ -f "$SECRETS_FILE" ] && while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
+            [[ "$label" =~ ^# ]] && continue
+            [ -z "$label" ] && continue
+            [ "$enabled" != "true" ] && continue
+            _ci=${_cum_user_in[$label]:-0}; _co=${_cum_user_out[$label]:-0}
+            _pci=${_prev_log_in[$label]:-0}; _pco=${_prev_log_out[$label]:-0}
+            _di=$((_ci - _pci)); _do=$((_co - _pco))
+            [ "$_di" -le 0 ] && [ "$_do" -le 0 ] && { _prev_log_in[$label]=$_ci; _prev_log_out[$label]=$_co; continue; }
+            [ "$_di" -lt 0 ] && _di=0; [ "$_do" -lt 0 ] && _do=0
+            echo "${_ts} ${label}: ↓$(format_bytes $_di) ↑$(format_bytes $_do)" >> "$_connlog"
+            _prev_log_in[$label]=$_ci; _prev_log_out[$label]=$_co
+        done < "$SECRETS_FILE"
+        # Auto-rotate: keep last 8000 lines if over 10000
+        if [ -f "$_connlog" ]; then
+            _lc=$(wc -l < "$_connlog" 2>/dev/null) || _lc=0
+            [ "$_lc" -gt 10000 ] && tail -n 8000 "$_connlog" > "${_connlog}.tmp" && mv "${_connlog}.tmp" "$_connlog"
+        fi
+    fi
+
+    # Quota enforcement + expiry checks every 5 min (runs even if Telegram is disabled)
+    if [ $((_now - _last_enforcement)) -ge 300 ]; then
+        _last_enforcement=$_now
+
+        # Quota enforcement (auto-disable secrets that exceeded quota)
+        _quota_file="${INSTALL_DIR}/relay_stats/.quota_alerts_sent"
+        [ -f "$SECRETS_FILE" ] && while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
+            [[ "$label" =~ ^# ]] && continue
+            [ -z "$label" ] || [ "$_q" = "0" ] || [ -z "$_q" ] && continue
+            [ "$enabled" != "true" ] && continue
+            total_bytes=$(( ${_cum_user_in[$label]:-0} + ${_cum_user_out[$label]:-0} ))
+            [ "$total_bytes" -le 0 ] && continue
+            pct=$(( total_bytes * 100 / _q ))
+            if [ "$pct" -ge 100 ]; then
+                if ! grep -q "^${label}|100$" "$_quota_file" 2>/dev/null; then
+                    if "${INSTALL_DIR}/mtproxymax" secret disable "$label" &>/dev/null; then
+                        [ "$TELEGRAM_ENABLED" = "true" ] && tg_send "🔴 *Quota Exceeded — Auto-disabled*\n\nSecret *$(_esc "$label")* used $(format_bytes $total_bytes) of $(format_bytes $_q) (${pct}%)\n\nRe-enable: \`mtproxymax secret reenable $label\`"
+                    else
+                        [ "$TELEGRAM_ENABLED" = "true" ] && tg_send "⚠️ *Quota Exceeded*\n\nSecret *$(_esc "$label")* used $(format_bytes $total_bytes) of $(format_bytes $_q) (${pct}%) — cannot auto-disable (last active secret)"
+                    fi
+                    echo "${label}|100" >> "$_quota_file"
+                fi
+            elif [ "$pct" -ge 80 ]; then
+                if ! grep -q "^${label}|80$" "$_quota_file" 2>/dev/null; then
+                    [ "$TELEGRAM_ENABLED" = "true" ] && tg_send "⚠️ *Quota Warning*\n\nSecret *$(_esc "$label")* has used $(format_bytes $total_bytes) of $(format_bytes $_q) (${pct}%)"
+                    echo "${label}|80" >> "$_quota_file"
+                fi
+            fi
+        done < "$SECRETS_FILE"
+
+        # Secret expiry warnings
+        if [ "$TELEGRAM_ENABLED" = "true" ] && [ "$TELEGRAM_ALERTS_ENABLED" = "true" ]; then
+            _expiry_file="${INSTALL_DIR}/relay_stats/.expiry_alerts_sent"
+            _today=$(date +%Y-%m-%d)
+            [ -f "$SECRETS_FILE" ] && while IFS='|' read -r label secret created enabled _mc _mi _q _ex _notes; do
+                [[ "$label" =~ ^# ]] && continue
+                [ -z "$label" ] && continue
+                [ "$_ex" = "0" ] || [ -z "$_ex" ] && continue
+                exp_e=$(date -d "${_ex}" +%s 2>/dev/null) || continue
+                days_left=$(( (exp_e - _now) / 86400 ))
+                if [ "$days_left" -le 3 ] && [ "$days_left" -ge 0 ]; then
+                    if ! grep -q "^${label}:${_today}$" "$_expiry_file" 2>/dev/null; then
+                        tg_send "⚠️ *Expiry Warning*\n\nSecret *$(_esc "$label")* expires in *${days_left} day(s)* (${_ex})"
+                        echo "${label}:${_today}" >> "$_expiry_file"
+                    fi
+                elif [ "$days_left" -lt 0 ]; then
+                    if ! grep -q "^${label}:expired:${_today}$" "$_expiry_file" 2>/dev/null; then
+                        tg_send "🔴 *Secret Expired*\n\nSecret *$(_esc "$label")* expired on ${_ex}"
+                        echo "${label}:expired:${_today}" >> "$_expiry_file"
+                    fi
+                fi
+            done < "$SECRETS_FILE"
+            [ -f "$_expiry_file" ] && grep -q ":${_today}" "$_expiry_file" 2>/dev/null && \
+                grep ":${_today}" "$_expiry_file" > "${_expiry_file}.tmp" 2>/dev/null && \
+                mv "${_expiry_file}.tmp" "$_expiry_file" 2>/dev/null || true
+        fi
     fi
 
     [ "$TELEGRAM_ENABLED" != "true" ] && sleep 30 && continue
@@ -4170,6 +4436,7 @@ run_installer() {
     SECRETS_MAX_IPS=("0")
     SECRETS_QUOTA=("0")
     SECRETS_EXPIRES=("0")
+    SECRETS_NOTES=("")
 
     # Save everything
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATS_DIR" "$BACKUP_DIR"
@@ -4376,6 +4643,250 @@ uninstall() {
 
 # ── Section 17: CLI Dispatcher ──────────────────────────────
 
+# ── Multi-Port Instances ────────────────────────────────────
+
+declare -a INSTANCE_PORTS=()
+declare -a INSTANCE_METRICS_PORTS=()
+declare -a INSTANCE_ENABLED=()
+declare -a INSTANCE_LABELS=()
+
+load_instances() {
+    INSTANCE_PORTS=()
+    INSTANCE_METRICS_PORTS=()
+    INSTANCE_ENABLED=()
+    INSTANCE_LABELS=()
+    [ -f "$INSTANCES_FILE" ] || return 0
+    while IFS='|' read -r port mport enabled label; do
+        [[ "$port" =~ ^[[:space:]]*# ]] && continue
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        INSTANCE_PORTS+=("$port")
+        INSTANCE_METRICS_PORTS+=("${mport:-9091}")
+        INSTANCE_ENABLED+=("${enabled:-true}")
+        INSTANCE_LABELS+=("${label:-port-${port}}")
+    done < "$INSTANCES_FILE"
+}
+
+save_instances() {
+    local tmp; tmp=$(_mktemp) || return 1
+    echo "# MTProxyMax Instances — Format: PORT|METRICS_PORT|ENABLED|LABEL" > "$tmp"
+    local i
+    for i in "${!INSTANCE_PORTS[@]}"; do
+        echo "${INSTANCE_PORTS[$i]}|${INSTANCE_METRICS_PORTS[$i]}|${INSTANCE_ENABLED[$i]}|${INSTANCE_LABELS[$i]}" >> "$tmp"
+    done
+    chmod 600 "$tmp"
+    mv "$tmp" "$INSTANCES_FILE"
+}
+
+_next_free_metrics_port() {
+    local p=9091
+    while [ $p -lt 9200 ]; do
+        local used=false
+        # Check against primary metrics port
+        [ "$p" = "${PROXY_METRICS_PORT:-9090}" ] && used=true
+        # Check against existing instance metrics ports
+        if [ "$used" = "false" ]; then
+            for mp in "${INSTANCE_METRICS_PORTS[@]}"; do
+                [ "$mp" = "$p" ] && used=true && break
+            done
+        fi
+        [ "$used" = "false" ] && { echo "$p"; return; }
+        ((p++))
+    done
+    echo "9091"
+}
+
+instance_add() {
+    local port="$1" label="${2:-port-${1}}"
+    validate_port "$port" || return 1
+
+    # Check not same as primary
+    [ "$port" = "$PROXY_PORT" ] && { log_error "Port ${port} is already the primary proxy port"; return 1; }
+
+    # Check not duplicate
+    local i
+    for i in "${!INSTANCE_PORTS[@]}"; do
+        [ "${INSTANCE_PORTS[$i]}" = "$port" ] && { log_error "Instance on port ${port} already exists"; return 1; }
+    done
+
+    local mport; mport=$(_next_free_metrics_port)
+
+    INSTANCE_PORTS+=("$port")
+    INSTANCE_METRICS_PORTS+=("$mport")
+    INSTANCE_ENABLED+=("true")
+    INSTANCE_LABELS+=("$label")
+    save_instances
+
+    # Generate config for this instance
+    local inst_config="${CONFIG_DIR}/config-${port}.toml"
+    local _orig_port="$PROXY_PORT" _orig_mport="$PROXY_METRICS_PORT"
+    PROXY_PORT="$port"
+    PROXY_METRICS_PORT="$mport"
+    generate_telemt_config
+    mv "${CONFIG_DIR}/config.toml" "$inst_config" 2>/dev/null
+    PROXY_PORT="$_orig_port"
+    PROXY_METRICS_PORT="$_orig_mport"
+    # Regenerate primary config
+    generate_telemt_config
+
+    # Start container
+    local cname="mtproxymax-${port}"
+    local _docker_args=(
+        --name "$cname"
+        --restart unless-stopped
+        --network host
+        --ulimit nofile=65535:65535
+        --log-opt max-size=10m
+        --log-opt max-file=3
+    )
+    docker run -d "${_docker_args[@]}" \
+        -v "${inst_config}:/etc/telemt.toml:ro" \
+        "$(get_docker_image)" /etc/telemt.toml &>/dev/null
+
+    log_success "Instance started on port ${port} (container: ${cname}, metrics: ${mport})"
+}
+
+instance_remove() {
+    local port="$1"
+    local idx=-1 i
+    for i in "${!INSTANCE_PORTS[@]}"; do
+        [ "${INSTANCE_PORTS[$i]}" = "$port" ] && idx=$i && break
+    done
+    [ "$idx" = "-1" ] && { log_error "No instance on port ${port}"; return 1; }
+
+    # Stop and remove container
+    local cname="mtproxymax-${port}"
+    docker stop "$cname" &>/dev/null || true
+    docker rm -f "$cname" &>/dev/null || true
+
+    # Remove config
+    rm -f "${CONFIG_DIR}/config-${port}.toml"
+
+    # Remove from arrays
+    local new_ports=() new_mports=() new_enabled=() new_labels=()
+    for i in "${!INSTANCE_PORTS[@]}"; do
+        [ "$i" = "$idx" ] && continue
+        new_ports+=("${INSTANCE_PORTS[$i]}")
+        new_mports+=("${INSTANCE_METRICS_PORTS[$i]}")
+        new_enabled+=("${INSTANCE_ENABLED[$i]}")
+        new_labels+=("${INSTANCE_LABELS[$i]}")
+    done
+    INSTANCE_PORTS=("${new_ports[@]}")
+    INSTANCE_METRICS_PORTS=("${new_mports[@]}")
+    INSTANCE_ENABLED=("${new_enabled[@]}")
+    INSTANCE_LABELS=("${new_labels[@]}")
+    save_instances
+
+    log_success "Instance on port ${port} removed"
+}
+
+instance_list() {
+    echo ""
+    draw_header "PROXY INSTANCES"
+    echo ""
+    echo -e "  ${BOLD}Primary:${NC} port ${PROXY_PORT} (container: ${CONTAINER_NAME})"
+    local running; is_proxy_running && running="${GREEN}running${NC}" || running="${RED}stopped${NC}"
+    echo -e "    Status: ${running}"
+    echo ""
+
+    if [ ${#INSTANCE_PORTS[@]} -eq 0 ]; then
+        echo -e "  ${DIM}No additional instances${NC}"
+    else
+        local i
+        for i in "${!INSTANCE_PORTS[@]}"; do
+            local port="${INSTANCE_PORTS[$i]}" label="${INSTANCE_LABELS[$i]}"
+            local cname="mtproxymax-${port}"
+            local st
+            docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+            echo -e "  ${BOLD}${label}:${NC} port ${port} (container: ${cname})"
+            echo -e "    Status: ${st} | Metrics: ${INSTANCE_METRICS_PORTS[$i]}"
+        done
+    fi
+    echo ""
+}
+
+# ── Backup / Restore ────────────────────────────────────────
+
+create_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local ts; ts=$(date '+%Y%m%d-%H%M%S')
+    local backup_file="${BACKUP_DIR}/mtproxymax-${ts}.tar.gz"
+
+    # Create metadata
+    local meta_tmp; meta_tmp=$(_mktemp) || return 1
+    echo "version=${VERSION}" > "$meta_tmp"
+    echo "date=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$meta_tmp"
+    echo "hostname=$(hostname 2>/dev/null || echo unknown)" >> "$meta_tmp"
+    cp "$meta_tmp" "${INSTALL_DIR}/backup_meta.txt"
+    rm -f "$meta_tmp"
+
+    # Build file list (only existing files)
+    local files=()
+    for f in settings.conf secrets.conf upstreams.conf instances.conf backup_meta.txt connection.log; do
+        [ -f "${INSTALL_DIR}/$f" ] && files+=("$f")
+    done
+    [ -d "$STATS_DIR" ] && files+=("relay_stats")
+
+    tar czf "$backup_file" -C "$INSTALL_DIR" --exclude='*.lock' "${files[@]}" 2>/dev/null
+    chmod 600 "$backup_file"
+    rm -f "${INSTALL_DIR}/backup_meta.txt"
+
+    log_success "Backup created: ${backup_file}"
+    echo "$backup_file"
+}
+
+restore_backup() {
+    local backup_file="$1"
+    [ -z "$backup_file" ] && { log_error "Usage: mtproxymax restore <backup_file>"; return 1; }
+    [ ! -f "$backup_file" ] && { log_error "File not found: ${backup_file}"; return 1; }
+
+    # Validate backup
+    if ! tar tzf "$backup_file" 2>/dev/null | grep -q "settings.conf"; then
+        log_error "Invalid backup file (missing settings.conf)"
+        return 1
+    fi
+
+    # Show metadata
+    local meta; meta=$(tar xzf "$backup_file" -O backup_meta.txt 2>/dev/null)
+    if [ -n "$meta" ]; then
+        echo ""
+        echo -e "  ${BOLD}Backup Info:${NC}"
+        echo "$meta" | while IFS='=' read -r k v; do echo -e "    ${k}: ${v}"; done
+        echo ""
+    fi
+
+    echo -en "  ${YELLOW}This will overwrite current configuration. Continue? [y/N]:${NC} "
+    local confirm; read -r confirm
+    [[ "$confirm" =~ ^[yY] ]] || { log_info "Restore cancelled"; return 0; }
+
+    # Create backup of current state first
+    log_info "Backing up current state..."
+    create_backup &>/dev/null
+
+    # Extract
+    tar xzf "$backup_file" -C "$INSTALL_DIR" --exclude='backup_meta.txt' 2>/dev/null
+    chmod 600 "${SECRETS_FILE}" 2>/dev/null
+
+    log_success "Backup restored from: ${backup_file}"
+    log_info "Run 'mtproxymax restart' to apply changes"
+}
+
+list_backups() {
+    mkdir -p "$BACKUP_DIR"
+    local files; files=$(ls -1t "${BACKUP_DIR}"/mtproxymax-*.tar.gz 2>/dev/null)
+    if [ -z "$files" ]; then
+        log_info "No backups found in ${BACKUP_DIR}"
+        return
+    fi
+    echo ""
+    draw_header "BACKUPS"
+    echo ""
+    echo "$files" | while read -r f; do
+        local size; size=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+        echo -e "  ${BOLD}$(basename "$f")${NC}  ${DIM}(${size})${NC}"
+    done
+    echo ""
+}
+
 show_cli_help() {
     echo ""
     echo -e "  ${BRIGHT_CYAN}${BOLD}MTProxyMax${NC} ${DIM}v${VERSION}${NC} — The Ultimate Telegram Proxy Manager"
@@ -4450,6 +4961,63 @@ show_cli_help() {
     echo -e "    ${GREEN}version${NC}                 Show version"
     echo -e "    ${GREEN}help${NC}                    Show this help"
     echo ""
+}
+
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"    # backslash
+    s="${s//\"/\\\"}"    # double quote
+    s="${s//$'\n'/\\n}"  # newline
+    s="${s//$'\t'/\\t}"  # tab
+    printf '%s' "$s"
+}
+
+show_status_json() {
+    local status="stopped" uptime_secs=0 traffic_in=0 traffic_out=0 connections=0
+    if is_proxy_running; then
+        status="running"
+        uptime_secs=$(get_proxy_uptime 2>/dev/null) || uptime_secs=0
+        read -r traffic_in traffic_out connections < <(get_cumulative_proxy_stats)
+    fi
+
+    _load_all_cumulative_user_stats 2>/dev/null
+
+    local engine_ver
+    engine_ver=$(get_telemt_version 2>/dev/null) || engine_ver="unknown"
+
+    # Build JSON
+    printf '{\n'
+    printf '  "version": "%s",\n' "$VERSION"
+    printf '  "engine_version": "%s",\n' "$engine_ver"
+    printf '  "status": "%s",\n' "$status"
+    printf '  "port": %d,\n' "$PROXY_PORT"
+    printf '  "domain": "%s",\n' "$PROXY_DOMAIN"
+    printf '  "uptime_seconds": %d,\n' "$uptime_secs"
+    printf '  "connections": %d,\n' "${connections:-0}"
+    printf '  "traffic_in": %d,\n' "${traffic_in:-0}"
+    printf '  "traffic_out": %d,\n' "${traffic_out:-0}"
+    printf '  "secrets": [\n'
+
+    local i first=true
+    for i in "${!SECRETS_LABELS[@]}"; do
+        local label="${SECRETS_LABELS[$i]}"
+        [ "$first" = "true" ] && first=false || printf ',\n'
+        local u_in=${_batch_cum_in["$label"]:-0}
+        local u_out=${_batch_cum_out["$label"]:-0}
+        local u_conns=${_batch_cum_conns["$label"]:-0}
+        printf '    {\n'
+        printf '      "label": "%s",\n' "$label"
+        printf '      "enabled": %s,\n' "${SECRETS_ENABLED[$i]}"
+        printf '      "traffic_in": %d,\n' "$u_in"
+        printf '      "traffic_out": %d,\n' "$u_out"
+        printf '      "connections": %d,\n' "$u_conns"
+        printf '      "quota": %d,\n' "${SECRETS_QUOTA[$i]:-0}"
+        printf '      "expires": "%s",\n' "${SECRETS_EXPIRES[$i]:-0}"
+        printf '      "notes": "%s"\n' "$(_json_escape "${SECRETS_NOTES[$i]:-}")"
+        printf '    }'
+    done
+    printf '\n  ]\n'
+    printf '}\n'
 }
 
 show_status() {
@@ -4533,7 +5101,11 @@ cli_main() {
         status)
             load_settings
             load_secrets
-            show_status
+            if [ "$1" = "--json" ]; then
+                show_status_json
+            else
+                show_status
+            fi
             ;;
 
         secret)
@@ -4617,6 +5189,17 @@ cli_main() {
                     local sl_exp="${1:-}"
                     [ -z "$label" ] && { log_error "Usage: mtproxymax secret setlimits <label> <conns> <ips> <quota> [expires] [--no-restart]"; return 1; }
                     secret_set_limits "$label" "$sl_conns" "$sl_ips" "$sl_quota" "$sl_exp" "$_no_restart"
+                    ;;
+                reenable)
+                    check_root
+                    [ -z "$1" ] && { log_error "Usage: mtproxymax secret reenable <label>"; return 1; }
+                    secret_reenable "$1"
+                    ;;
+                note)
+                    local label="$1"; shift 2>/dev/null || true
+                    local note_text="$*"
+                    [ -z "$label" ] && { log_error "Usage: mtproxymax secret note <label> [text]"; return 1; }
+                    secret_edit_note "$label" "$note_text"
                     ;;
                 *)       log_error "Unknown: secret ${subcmd}"; show_cli_help; return 1 ;;
             esac
@@ -4861,6 +5444,63 @@ cli_main() {
             load_settings
             echo -e "  ${DIM}Streaming logs (Ctrl+C to stop)...${NC}"
             docker logs -f --tail 50 "$CONTAINER_NAME" 2>&1
+            ;;
+
+        instance)
+            load_settings
+            load_secrets
+            load_instances
+            local subcmd="${1:-list}"; shift 2>/dev/null || true
+            case "$subcmd" in
+                add)
+                    check_root
+                    [ -z "$1" ] && { log_error "Usage: mtproxymax instance add <port> [label]"; return 1; }
+                    instance_add "$1" "$2"
+                    ;;
+                remove)
+                    check_root
+                    [ -z "$1" ] && { log_error "Usage: mtproxymax instance remove <port>"; return 1; }
+                    instance_remove "$1"
+                    ;;
+                list|"")
+                    instance_list
+                    ;;
+                *) log_error "Unknown: instance ${subcmd}"; return 1 ;;
+            esac
+            ;;
+
+        backup)
+            check_root
+            load_settings
+            create_backup
+            ;;
+
+        restore)
+            check_root
+            load_settings
+            restore_backup "$1"
+            ;;
+
+        backups)
+            load_settings
+            list_backups
+            ;;
+
+        connlog)
+            load_settings
+            if [ "$1" = "clear" ]; then
+                check_root
+                > "$CONNECTION_LOG" 2>/dev/null
+                log_success "Connection log cleared"
+            elif [ -f "$CONNECTION_LOG" ] && [ -s "$CONNECTION_LOG" ]; then
+                echo ""
+                draw_header "CONNECTION LOG"
+                echo ""
+                tail -n "${1:-50}" "$CONNECTION_LOG"
+                echo ""
+            else
+                log_info "Connection log is empty"
+            fi
             ;;
 
         health)
@@ -5255,6 +5895,7 @@ show_secrets_menu() {
         echo -e "  ${DIM}[5]${NC} Set user limits"
         echo -e "  ${DIM}[6]${NC} Batch add secrets"
         echo -e "  ${DIM}[7]${NC} Batch remove secrets"
+        echo -e "  ${DIM}[8]${NC} Edit note/description"
         echo -e "  ${DIM}[0]${NC} Back"
 
         local choice
@@ -5326,6 +5967,15 @@ show_secrets_menu() {
                 if [ -n "$batch_labels" ]; then
                     # shellcheck disable=SC2086
                     secret_remove_batch "false" $batch_labels || true
+                fi
+                press_any_key
+                ;;
+            8)
+                echo -en "  ${BOLD}Label:${NC} "
+                local note_label
+                read -r note_label
+                if [ -n "$note_label" ]; then
+                    secret_edit_note "$note_label" || true
                 fi
                 press_any_key
                 ;;
@@ -5706,12 +6356,22 @@ show_traffic_menu() {
 
     echo ""
     echo -e "  ${DIM}[1]${NC} Stream live logs"
+    echo -e "  ${DIM}[2]${NC} Connection log"
     echo -e "  ${DIM}[0]${NC} Back"
 
     local choice
     choice=$(read_choice "Choice" "0")
     case "$choice" in
         1) echo -e "  ${DIM}Press Ctrl+C to stop...${NC}"; docker logs -f --tail 30 "$CONTAINER_NAME" 2>&1 || true ;;
+        2)
+            echo ""
+            if [ -f "$CONNECTION_LOG" ] && [ -s "$CONNECTION_LOG" ]; then
+                tail -n 50 "$CONNECTION_LOG"
+            else
+                echo -e "  ${DIM}Connection log is empty${NC}"
+            fi
+            press_any_key
+            ;;
     esac
 }
 
@@ -6432,12 +7092,24 @@ show_about() {
         draw_box_bottom "$w"
         echo ""
         echo -e "  ${DIM}[1]${NC} Check for updates"
+        echo -e "  ${DIM}[2]${NC} Create backup"
+        echo -e "  ${DIM}[3]${NC} Restore backup"
+        echo -e "  ${DIM}[4]${NC} List backups"
         echo -e "  ${DIM}[0]${NC} Back"
 
         local choice
         choice=$(read_choice "Choice" "0")
         case "$choice" in
             1) self_update || true; press_any_key ;;
+            2) create_backup || true; press_any_key ;;
+            3)
+                list_backups
+                echo -en "  ${BOLD}Backup file path:${NC} "
+                local bf; read -r bf
+                [ -n "$bf" ] && restore_backup "$bf" || true
+                press_any_key
+                ;;
+            4) list_backups; press_any_key ;;
             0|"") return ;;
             *) ;;
         esac

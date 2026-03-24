@@ -5,7 +5,7 @@
     One script. Full control. Zero hassle.
   </p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-1.0.2-brightgreen" alt="Version"/>
+    <img src="https://img.shields.io/badge/version-1.0.3-brightgreen" alt="Version"/>
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/>
     <img src="https://img.shields.io/badge/engine-Rust_(telemt_3.x)-orange" alt="Engine"/>
     <img src="https://img.shields.io/badge/platform-Linux-lightgrey" alt="Platform"/>
@@ -505,6 +505,19 @@ mtproxymax telegram remove              # Remove bot completely
 ---
 
 ## 📋 Changelog
+
+### v1.0.3 — Notes, Quota Enforcement, Multi-Port & More
+
+- **Secret Notes** — Attach descriptions to secrets (`secret note <label> <text>`, TUI option [8])
+- **Expiry Warnings** — Secret list shows `(3d left)` / `(expired)`, Telegram alerts 3 days before expiry
+- **Quota Enforcement** — Auto-disables secrets at 100% quota, warns at 80%, works even without Telegram bot
+- **Auto-disable on Quota Hit** — `secret reenable <label>` to restore with optional traffic reset
+- **JSON Status** — `mtproxymax status --json` for Grafana/Zabbix/monitoring integration
+- **Connection Log** — Per-user activity log with auto-rotation (`connlog` CLI, TUI Logs & Traffic > [2])
+- **Backup & Restore** — `mtproxymax backup`, `restore <file>`, `backups` — includes all config, secrets, and stats
+- **Multi-Port Instances** — Run proxy on multiple ports with shared secrets (`instance add/remove/list`)
+- **Hot-Reload for Secrets** — Add/remove/rotate secrets without dropping active connections
+- **Whitelist Geo-Blocking** — Allow only specific countries, block everything else ([#29](https://github.com/SamNet-dev/MTProxyMax/issues/29))
 
 ### v1.0.2 — Persistent Traffic & TUI Performance
 
