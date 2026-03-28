@@ -2734,8 +2734,12 @@ stop_proxy_container() {
     if is_proxy_running; then
         # Flush traffic counters to disk before stopping
         flush_traffic_to_disk 2>/dev/null
+        # Prevent Docker from auto-restarting the container
+        docker update --restart=no "$CONTAINER_NAME" &>/dev/null || true
         if docker stop --timeout 10 "$CONTAINER_NAME" 2>/dev/null; then
             traffic_tracking_teardown
+            # Signal intentional stop — prevents bot auto-recovery from restarting
+            echo "$(date +%s)" > /tmp/.mtproxymax_stopped 2>/dev/null || true
             log_success "Proxy stopped"
         else
             log_error "Failed to stop proxy"
@@ -2778,6 +2782,9 @@ _start_all_instances() {
 }
 
 start_proxy_container() {
+    # Clear intentional-stop flag
+    rm -f /tmp/.mtproxymax_stopped 2>/dev/null
+
     if is_proxy_running; then
         log_info "Proxy is already running"
         return 0
@@ -3226,7 +3233,7 @@ health_check() {
 }
 
 auto_recover() {
-    if ! is_proxy_running; then
+    if ! is_proxy_running && [ ! -f /tmp/.mtproxymax_stopped ]; then
         log_warn "Proxy is down, attempting auto-recovery..."
         start_proxy_container
     fi
@@ -4327,7 +4334,7 @@ while true; do
     # Health check every 5 minutes
     if [ $((_now - _last_health)) -ge 300 ]; then
         _last_health=$_now
-        if [ "$TELEGRAM_ALERTS_ENABLED" = "true" ] && ! is_running; then
+        if [ "$TELEGRAM_ALERTS_ENABLED" = "true" ] && ! is_running && [ ! -f /tmp/.mtproxymax_stopped ]; then
             tg_send "🔴 *Alert*: Proxy is down! Attempting auto-restart..."
             "${INSTALL_DIR}/mtproxymax" start &>/dev/null
             sleep 5
