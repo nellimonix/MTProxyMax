@@ -7823,6 +7823,8 @@ show_secrets_menu() {
         echo -e "  ${DIM}[7]${NC} Batch remove secrets"
         echo -e "  ${DIM}[8]${NC} Edit note/description"
         echo -e "  ${DIM}[9]${NC} Rename a secret"
+        echo -e "  ${DIM}[c]${NC} Clone a secret"
+        echo -e "  ${DIM}[e]${NC} Bulk-extend all expiry dates"
         echo -e "  ${DIM}[d]${NC} Disable expired secrets"
         echo -e "  ${DIM}[0]${NC} Back"
 
@@ -7935,6 +7937,25 @@ show_secrets_menu() {
                     local new_label; read -r new_label
                     [ -n "$new_label" ] && { secret_rename "$old_label" "$new_label" || true; }
                 fi
+                press_any_key
+                ;;
+            c|C)
+                echo -en "  ${BOLD}Source label or #:${NC} "
+                local src_label; read -r src_label
+                if [[ "$src_label" =~ ^[0-9]+$ ]] && [ "$src_label" -ge 1 ] && [ "$src_label" -le "${#SECRETS_LABELS[@]}" ]; then
+                    src_label="${SECRETS_LABELS[$((src_label - 1))]}"
+                fi
+                if [ -n "$src_label" ]; then
+                    echo -en "  ${BOLD}New label:${NC} "
+                    local clone_label; read -r clone_label
+                    [ -n "$clone_label" ] && { secret_clone "$src_label" "$clone_label" || true; }
+                fi
+                press_any_key
+                ;;
+            e|E)
+                echo -en "  ${BOLD}Extend all by how many days?${NC} "
+                local ext_days; read -r ext_days
+                [ -n "$ext_days" ] && { secret_bulk_extend "$ext_days" || true; }
                 press_any_key
                 ;;
             d|D) secret_disable_expired; press_any_key ;;
