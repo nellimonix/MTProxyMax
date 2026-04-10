@@ -12,7 +12,7 @@
 #   curl -sL https://raw.githubusercontent.com/SamNet-dev/MTProxyMax/main/install.sh \
 #     | sudo MTPROXY_SECRET=000102030405060708090a0b0c0d0e0f MTPROXY_LABEL=alice bash
 set -e
-SCRIPT_URL="https://raw.githubusercontent.com/SamNet-dev/MTProxyMax/main/mtproxymax.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/nellimonix/MTProxyMax/refs/heads/main/mtproxymax.sh"
 if [ "$(id -u)" -ne 0 ]; then echo "Run as root: curl -sL $SCRIPT_URL | sudo bash" >&2; exit 1; fi
 curl -fsSL "$SCRIPT_URL" -o /tmp/mtproxymax.sh && \
   MTPROXY_SECRET="${MTPROXY_SECRET:-}" \
