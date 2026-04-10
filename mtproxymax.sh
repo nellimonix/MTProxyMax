@@ -2565,6 +2565,7 @@ secret_stats() {
     printf "  ${BOLD}%-14s %5s %6s %10s %10s %6s %8s %10s${NC}\n" "LABEL" "CONNS" "IPs" "DOWN" "UP" "QUOTA" "USED" "EXPIRES"
     echo -e "  ${DIM}$(_repeat '─' 80)${NC}"
 
+    local now_epoch; now_epoch=$(date +%s)
     local i
     for i in "${!SECRETS_LABELS[@]}"; do
         [ "${SECRETS_ENABLED[$i]}" = "true" ] || continue
@@ -2594,7 +2595,6 @@ secret_stats() {
         local exp_str="${DIM}—${NC}"
         if [ "$exp" != "0" ]; then
             local exp_epoch; exp_epoch=$(_iso_to_epoch "$exp")
-            local now_epoch; now_epoch=$(date +%s)
             local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
             if [ $days_left -lt 0 ]; then
                 exp_str="${RED}expired${NC}"
@@ -2784,11 +2784,16 @@ run_doctor() {
 
     # Telegram bot
     if [ "$TELEGRAM_ENABLED" = "true" ] && [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        if curl -s --max-time 5 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>/dev/null | grep -q '"ok":true'; then
-            echo -e "  ${GREEN}${SYM_CHECK}${NC} Telegram bot reachable"
-        else
-            echo -e "  ${YELLOW}!${NC}  Telegram bot unreachable (can't reach api.telegram.org)"
-            issues=$((issues + 1))
+        local _cfg; _cfg=$(_mktemp) || true
+        if [ -n "$_cfg" ]; then
+            printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$TELEGRAM_BOT_TOKEN" > "$_cfg"
+            if curl -s --max-time 5 -K "$_cfg" 2>/dev/null | grep -q '"ok":true'; then
+                echo -e "  ${GREEN}${SYM_CHECK}${NC} Telegram bot reachable"
+            else
+                echo -e "  ${YELLOW}!${NC}  Telegram bot unreachable (can't reach api.telegram.org)"
+                issues=$((issues + 1))
+            fi
+            rm -f "$_cfg"
         fi
     fi
 
@@ -2810,31 +2815,17 @@ _startup_warnings() {
     for i in "${!SECRETS_LABELS[@]}"; do
         [ "${SECRETS_ENABLED[$i]}" = "true" ] || continue
         local exp="${SECRETS_EXPIRES[$i]:-0}"
-        if [ "$exp" != "0" ]; then
-            local exp_epoch; exp_epoch=$(_iso_to_epoch "$exp")
-            if [ "$exp_epoch" -le "$now_epoch" ]; then
-                [ $warnings -eq 0 ] && echo ""
-                log_warn "Secret '${SECRETS_LABELS[$i]}' is expired"
-                warnings=$((warnings + 1))
-            elif [ $((exp_epoch - now_epoch)) -le 259200 ]; then
-                local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
-                [ $warnings -eq 0 ] && echo ""
-                log_warn "Secret '${SECRETS_LABELS[$i]}' expires in ${days_left}d"
-                warnings=$((warnings + 1))
-            fi
-        fi
-        local quota="${SECRETS_QUOTA[$i]:-0}"
-        if [ "$quota" != "0" ] && [ "$quota" -gt 0 ] 2>/dev/null; then
-            local m_rx m_tx
-            m_rx=$(echo "${_METRICS_CACHE:-}" | awk -v u="${SECRETS_LABELS[$i]}" '$0 ~ "telemt_user_octets_from_client.*user=\""u"\"" {print $NF}')
-            m_tx=$(echo "${_METRICS_CACHE:-}" | awk -v u="${SECRETS_LABELS[$i]}" '$0 ~ "telemt_user_octets_to_client.*user=\""u"\"" {print $NF}')
-            local total=$(( ${m_rx:-0} + ${m_tx:-0} ))
-            local pct=$((total * 100 / quota))
-            if [ $pct -ge 80 ]; then
-                [ $warnings -eq 0 ] && echo ""
-                log_warn "Secret '${SECRETS_LABELS[$i]}' at ${pct}% quota"
-                warnings=$((warnings + 1))
-            fi
+        [ "$exp" = "0" ] && continue
+        local exp_epoch; exp_epoch=$(_iso_to_epoch "$exp")
+        if [ "$exp_epoch" -le "$now_epoch" ]; then
+            [ $warnings -eq 0 ] && echo ""
+            log_warn "Secret '${SECRETS_LABELS[$i]}' is expired"
+            warnings=$((warnings + 1))
+        elif [ $((exp_epoch - now_epoch)) -le 259200 ]; then
+            local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+            [ $warnings -eq 0 ] && echo ""
+            log_warn "Secret '${SECRETS_LABELS[$i]}' expires in ${days_left}d"
+            warnings=$((warnings + 1))
         fi
     done
 }
