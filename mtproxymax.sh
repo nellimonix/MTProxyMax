@@ -2378,7 +2378,7 @@ secret_import() {
 
     local added=0 skipped=0
     while IFS='|' read -r label key enabled max_conns max_ips quota expires notes; do
-        [[ "$label" =~ ^#|^$ ]] && continue
+        [[ "$label" =~ ^# ]] || [ -z "$label" ] && continue
         # Skip if label already exists
         local exists=false i
         for i in "${!SECRETS_LABELS[@]}"; do
