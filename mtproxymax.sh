@@ -1725,6 +1725,12 @@ secret_add() {
     echo ""
     echo -e "  ${BOLD}Web Link:${NC}"
     echo -e "  ${CYAN}https://t.me/proxy?server=${server_ip}&port=${PROXY_PORT}&secret=${full_secret}${NC}"
+
+    # Show QR code inline if qrencode is available
+    if command -v qrencode &>/dev/null; then
+        echo ""
+        qrencode -t ANSIUTF8 "tg://proxy?server=${server_ip}&port=${PROXY_PORT}&secret=${full_secret}" 2>/dev/null | sed 's/^/  /'
+    fi
     echo ""
 }
 
@@ -2492,6 +2498,347 @@ secret_disable_expired() {
     fi
 }
 
+# Extend a secret's expiry by N days
+secret_extend() {
+    local label="$1" days="$2"
+    [ -z "$label" ] || [ -z "$days" ] && { log_error "Usage: mtproxymax secret extend <label> <days>"; return 1; }
+    [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -gt 0 ] || { log_error "Days must be a positive number"; return 1; }
+
+    local idx=-1 i
+    for i in "${!SECRETS_LABELS[@]}"; do
+        [ "${SECRETS_LABELS[$i]}" = "$label" ] && { idx=$i; break; }
+    done
+    [ $idx -eq -1 ] && { log_error "Secret '${label}' not found"; return 1; }
+
+    local exp="${SECRETS_EXPIRES[$idx]:-0}"
+    local base_epoch
+    if [ "$exp" = "0" ]; then
+        # No expiry set — extend from now
+        base_epoch=$(date +%s)
+    else
+        base_epoch=$(_iso_to_epoch "$exp")
+        # If already expired, extend from now instead of the past date
+        local now_epoch; now_epoch=$(date +%s)
+        [ "$base_epoch" -le "$now_epoch" ] && base_epoch=$now_epoch
+    fi
+
+    local new_epoch=$((base_epoch + days * 86400))
+    local new_date
+    new_date=$(date -u -d "@${new_epoch}" '+%Y-%m-%dT23:59:59Z' 2>/dev/null) || \
+    new_date=$(date -u -r "$new_epoch" '+%Y-%m-%dT23:59:59Z' 2>/dev/null) || \
+    new_date=$(python3 -c "import datetime;print(datetime.datetime.utcfromtimestamp(${new_epoch}).strftime('%Y-%m-%dT23:59:59Z'))" 2>/dev/null)
+
+    [ -z "$new_date" ] && { log_error "Failed to compute new expiry date"; return 1; }
+
+    SECRETS_EXPIRES[$idx]="$new_date"
+    # Re-enable if it was disabled due to expiry
+    [ "${SECRETS_ENABLED[$idx]}" = "false" ] && SECRETS_ENABLED[$idx]="true"
+    save_secrets
+    reload_proxy_config
+    log_success "Secret '${label}' expiry extended by ${days}d → ${new_date%%T*}"
+}
+
+# Compact per-user stats
+secret_stats() {
+    local m
+    m=$(_fetch_metrics 2>/dev/null) || true
+
+    # Parse live metrics in one awk pass
+    local parsed=""
+    if [ -n "$m" ]; then
+        parsed=$(echo "$m" | awk '
+            function lbl(s, k,    p, q) {
+                p = index(s, k "=\""); if (!p) return ""
+                s = substr(s, p + length(k) + 2)
+                q = index(s, "\""); return q ? substr(s, 1, q-1) : ""
+            }
+            /^telemt_user_connections_current\{/  { u=lbl($0,"user"); if(u) uc[u]+=$NF }
+            /^telemt_user_octets_from_client\{/   { u=lbl($0,"user"); if(u) rx[u]+=$NF }
+            /^telemt_user_octets_to_client\{/     { u=lbl($0,"user"); if(u) tx[u]+=$NF }
+            /^telemt_user_unique_ips_current\{/   { u=lbl($0,"user"); if(u) ip[u]+=$NF }
+            END { for (u in uc) printf "%s|%.0f|%.0f|%.0f|%.0f\n", u, uc[u]+0, rx[u]+0, tx[u]+0, ip[u]+0 }
+        ')
+    fi
+
+    draw_header "USER STATS"
+    echo ""
+    printf "  ${BOLD}%-14s %5s %6s %10s %10s %6s %8s %10s${NC}\n" "LABEL" "CONNS" "IPs" "DOWN" "UP" "QUOTA" "USED" "EXPIRES"
+    echo -e "  ${DIM}$(_repeat '─' 80)${NC}"
+
+    local i
+    for i in "${!SECRETS_LABELS[@]}"; do
+        [ "${SECRETS_ENABLED[$i]}" = "true" ] || continue
+        local label="${SECRETS_LABELS[$i]}"
+        local quota="${SECRETS_QUOTA[$i]:-0}"
+        local exp="${SECRETS_EXPIRES[$i]:-0}"
+
+        # Live metrics for this user
+        local conns=0 rx=0 tx=0 ips=0
+        if [ -n "$parsed" ]; then
+            local line; line=$(echo "$parsed" | grep "^${label}|" | head -1)
+            if [ -n "$line" ]; then
+                IFS='|' read -r _ conns rx tx ips <<< "$line"
+            fi
+        fi
+
+        # Quota usage
+        local quota_str="${DIM}—${NC}" used_str="${DIM}—${NC}"
+        if [ "$quota" != "0" ] && [ "$quota" -gt 0 ] 2>/dev/null; then
+            quota_str=$(format_bytes "$quota")
+            local total_bytes=$((rx + tx))
+            local pct=$((total_bytes * 100 / quota))
+            [ $pct -ge 80 ] && used_str="${YELLOW}${pct}%${NC}" || used_str="${pct}%"
+        fi
+
+        # Expiry
+        local exp_str="${DIM}—${NC}"
+        if [ "$exp" != "0" ]; then
+            local exp_epoch; exp_epoch=$(_iso_to_epoch "$exp")
+            local now_epoch; now_epoch=$(date +%s)
+            local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+            if [ $days_left -lt 0 ]; then
+                exp_str="${RED}expired${NC}"
+            elif [ $days_left -le 3 ]; then
+                exp_str="${YELLOW}${days_left}d${NC}"
+            else
+                exp_str="${days_left}d"
+            fi
+        fi
+
+        printf "  %-14s %5s %6s %10s %10s %6b %8b %10b\n" \
+            "$label" "$conns" "$ips" "$(format_bytes "$rx")" "$(format_bytes "$tx")" "$quota_str" "$used_str" "$exp_str"
+    done
+    echo ""
+}
+
+# Sort secrets by field
+secret_sort() {
+    local field="${1:-traffic}"
+    local m
+    m=$(_fetch_metrics 2>/dev/null) || true
+
+    # Build sortable data: idx|sort_value
+    local -a sort_data=()
+    local i
+    for i in "${!SECRETS_LABELS[@]}"; do
+        local label="${SECRETS_LABELS[$i]}"
+        local val=0
+        case "$field" in
+            traffic|t)
+                if [ -n "$m" ]; then
+                    local rx tx
+                    rx=$(echo "$m" | awk -v u="$label" '$0 ~ "telemt_user_octets_from_client.*user=\""u"\"" {print $NF}')
+                    tx=$(echo "$m" | awk -v u="$label" '$0 ~ "telemt_user_octets_to_client.*user=\""u"\"" {print $NF}')
+                    val=$(( ${rx:-0} + ${tx:-0} ))
+                fi
+                ;;
+            conns|c)
+                if [ -n "$m" ]; then
+                    val=$(echo "$m" | awk -v u="$label" '$0 ~ "telemt_user_connections_current.*user=\""u"\"" {print $NF}')
+                    val=${val:-0}
+                fi
+                ;;
+            date|d) val="${SECRETS_CREATED[$i]}" ;;
+            name|n) ;; # handled separately
+        esac
+        sort_data+=("${i}|${val}|${label}")
+    done
+
+    # Sort
+    local sorted
+    if [ "$field" = "name" ] || [ "$field" = "n" ]; then
+        sorted=$(printf '%s\n' "${sort_data[@]}" | sort -t'|' -k3)
+    else
+        sorted=$(printf '%s\n' "${sort_data[@]}" | sort -t'|' -k2 -rn)
+    fi
+
+    # Rebuild arrays in sorted order
+    local -a new_labels=() new_keys=() new_created=() new_enabled=() new_conns=() new_ips=() new_quota=() new_expires=() new_notes=()
+    while IFS='|' read -r idx _ _; do
+        new_labels+=("${SECRETS_LABELS[$idx]}")
+        new_keys+=("${SECRETS_KEYS[$idx]}")
+        new_created+=("${SECRETS_CREATED[$idx]}")
+        new_enabled+=("${SECRETS_ENABLED[$idx]}")
+        new_conns+=("${SECRETS_MAX_CONNS[$idx]}")
+        new_ips+=("${SECRETS_MAX_IPS[$idx]}")
+        new_quota+=("${SECRETS_QUOTA[$idx]}")
+        new_expires+=("${SECRETS_EXPIRES[$idx]}")
+        new_notes+=("${SECRETS_NOTES[$idx]}")
+    done <<< "$sorted"
+
+    SECRETS_LABELS=("${new_labels[@]}")
+    SECRETS_KEYS=("${new_keys[@]}")
+    SECRETS_CREATED=("${new_created[@]}")
+    SECRETS_ENABLED=("${new_enabled[@]}")
+    SECRETS_MAX_CONNS=("${new_conns[@]}")
+    SECRETS_MAX_IPS=("${new_ips[@]}")
+    SECRETS_QUOTA=("${new_quota[@]}")
+    SECRETS_EXPIRES=("${new_expires[@]}")
+    SECRETS_NOTES=("${new_notes[@]}")
+
+    save_secrets
+    log_success "Secrets sorted by ${field}"
+}
+
+# Doctor: comprehensive diagnostics
+run_doctor() {
+    echo ""
+    draw_header "DOCTOR"
+    echo ""
+    local issues=0
+
+    # Docker
+    if command -v docker &>/dev/null; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Docker installed"
+    else
+        echo -e "  ${RED}${SYM_CROSS}${NC} Docker not installed"
+        issues=$((issues + 1))
+    fi
+
+    # Container
+    if is_proxy_running; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Engine running"
+    else
+        echo -e "  ${RED}${SYM_CROSS}${NC} Engine not running"
+        issues=$((issues + 1))
+    fi
+
+    # Port listening
+    if ! is_port_available "$PROXY_PORT" 2>/dev/null; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Port ${PROXY_PORT} listening"
+    elif is_proxy_running; then
+        echo -e "  ${RED}${SYM_CROSS}${NC} Port ${PROXY_PORT} not listening (engine running but port not bound)"
+        issues=$((issues + 1))
+    else
+        echo -e "  ${DIM}—${NC}  Port ${PROXY_PORT} (engine stopped)"
+    fi
+
+    # Metrics endpoint
+    if curl -s --max-time 2 "http://127.0.0.1:${PROXY_METRICS_PORT:-9090}/metrics" &>/dev/null; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Metrics endpoint responding"
+    elif is_proxy_running; then
+        echo -e "  ${RED}${SYM_CROSS}${NC} Metrics endpoint not responding"
+        issues=$((issues + 1))
+    else
+        echo -e "  ${DIM}—${NC}  Metrics endpoint (engine stopped)"
+    fi
+
+    # Domain reachable
+    local domain="${PROXY_DOMAIN:-cloudflare.com}"
+    if curl -s --max-time 5 -o /dev/null "https://${domain}" 2>/dev/null; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Domain ${domain} reachable (TLS cert fetch will work)"
+    else
+        echo -e "  ${YELLOW}!${NC}  Domain ${domain} unreachable (engine will use fallback cert)"
+        issues=$((issues + 1))
+    fi
+
+    # Secrets
+    local active=0 disabled=0 expired=0 near_expiry=0 near_quota=0
+    local now_epoch; now_epoch=$(date +%s)
+    for i in "${!SECRETS_LABELS[@]}"; do
+        if [ "${SECRETS_ENABLED[$i]}" = "true" ]; then
+            active=$((active + 1))
+        else
+            disabled=$((disabled + 1))
+        fi
+        local exp="${SECRETS_EXPIRES[$i]:-0}"
+        if [ "$exp" != "0" ]; then
+            local exp_epoch; exp_epoch=$(_iso_to_epoch "$exp")
+            if [ "$exp_epoch" -le "$now_epoch" ]; then
+                expired=$((expired + 1))
+            elif [ $((exp_epoch - now_epoch)) -le 259200 ]; then  # 3 days
+                near_expiry=$((near_expiry + 1))
+            fi
+        fi
+    done
+
+    if [ $active -gt 0 ]; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} ${active} active secret(s)"
+    else
+        echo -e "  ${RED}${SYM_CROSS}${NC} No active secrets"
+        issues=$((issues + 1))
+    fi
+
+    [ $expired -gt 0 ] && { echo -e "  ${YELLOW}!${NC}  ${expired} expired secret(s) — run: mtproxymax secret disable-expired"; issues=$((issues + 1)); }
+    [ $near_expiry -gt 0 ] && echo -e "  ${YELLOW}!${NC}  ${near_expiry} secret(s) expiring within 3 days"
+
+    # Disk space
+    local disk_pct
+    disk_pct=$(df -h "${INSTALL_DIR:-/opt/mtproxymax}" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+    if [ -n "$disk_pct" ] && [ "$disk_pct" -ge 90 ] 2>/dev/null; then
+        echo -e "  ${RED}${SYM_CROSS}${NC} Disk usage ${disk_pct}% — critically low"
+        issues=$((issues + 1))
+    elif [ -n "$disk_pct" ] && [ "$disk_pct" -ge 80 ] 2>/dev/null; then
+        echo -e "  ${YELLOW}!${NC}  Disk usage ${disk_pct}%"
+    elif [ -n "$disk_pct" ]; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Disk usage ${disk_pct}%"
+    fi
+
+    # Config file
+    if [ -f "${CONFIG_DIR}/config.toml" ]; then
+        echo -e "  ${GREEN}${SYM_CHECK}${NC} Config file exists"
+    else
+        echo -e "  ${RED}${SYM_CROSS}${NC} Config file missing — run: mtproxymax restart"
+        issues=$((issues + 1))
+    fi
+
+    # Telegram bot
+    if [ "$TELEGRAM_ENABLED" = "true" ] && [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        if curl -s --max-time 5 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>/dev/null | grep -q '"ok":true'; then
+            echo -e "  ${GREEN}${SYM_CHECK}${NC} Telegram bot reachable"
+        else
+            echo -e "  ${YELLOW}!${NC}  Telegram bot unreachable (can't reach api.telegram.org)"
+            issues=$((issues + 1))
+        fi
+    fi
+
+    echo ""
+    if [ $issues -eq 0 ]; then
+        echo -e "  ${BRIGHT_GREEN}All checks passed${NC}"
+    else
+        echo -e "  ${YELLOW}${issues} issue(s) found${NC}"
+    fi
+    echo ""
+}
+
+# Startup warnings (called after proxy start)
+_startup_warnings() {
+    local now_epoch; now_epoch=$(date +%s)
+    local warnings=0
+
+    local i
+    for i in "${!SECRETS_LABELS[@]}"; do
+        [ "${SECRETS_ENABLED[$i]}" = "true" ] || continue
+        local exp="${SECRETS_EXPIRES[$i]:-0}"
+        if [ "$exp" != "0" ]; then
+            local exp_epoch; exp_epoch=$(_iso_to_epoch "$exp")
+            if [ "$exp_epoch" -le "$now_epoch" ]; then
+                [ $warnings -eq 0 ] && echo ""
+                log_warn "Secret '${SECRETS_LABELS[$i]}' is expired"
+                warnings=$((warnings + 1))
+            elif [ $((exp_epoch - now_epoch)) -le 259200 ]; then
+                local days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+                [ $warnings -eq 0 ] && echo ""
+                log_warn "Secret '${SECRETS_LABELS[$i]}' expires in ${days_left}d"
+                warnings=$((warnings + 1))
+            fi
+        fi
+        local quota="${SECRETS_QUOTA[$i]:-0}"
+        if [ "$quota" != "0" ] && [ "$quota" -gt 0 ] 2>/dev/null; then
+            local m_rx m_tx
+            m_rx=$(echo "${_METRICS_CACHE:-}" | awk -v u="${SECRETS_LABELS[$i]}" '$0 ~ "telemt_user_octets_from_client.*user=\""u"\"" {print $NF}')
+            m_tx=$(echo "${_METRICS_CACHE:-}" | awk -v u="${SECRETS_LABELS[$i]}" '$0 ~ "telemt_user_octets_to_client.*user=\""u"\"" {print $NF}')
+            local total=$(( ${m_rx:-0} + ${m_tx:-0} ))
+            local pct=$((total * 100 / quota))
+            if [ $pct -ge 80 ]; then
+                [ $warnings -eq 0 ] && echo ""
+                log_warn "Secret '${SECRETS_LABELS[$i]}' at ${pct}% quota"
+                warnings=$((warnings + 1))
+            fi
+        fi
+    done
+}
+
 # ── Section 8b: Upstream Management ──────────────────────────
 
 # Add a new upstream
@@ -2888,6 +3235,9 @@ run_proxy_container() {
             done
             echo ""
         fi
+
+        # Startup warnings (expired secrets, near-quota users)
+        _startup_warnings
 
         # Notify via Telegram
         telegram_notify_proxy_started &>/dev/null &
@@ -6062,6 +6412,9 @@ show_cli_help() {
     echo -e "    ${GREEN}secret export${NC}                 Export secrets to CSV (stdout)"
     echo -e "    ${GREEN}secret import${NC} <file>          Import secrets from CSV file"
     echo -e "    ${GREEN}secret disable-expired${NC}        Disable all expired secrets"
+    echo -e "    ${GREEN}secret extend${NC} <label> <days>  Extend expiry by N days"
+    echo -e "    ${GREEN}secret stats${NC}                  Compact per-user stats overview"
+    echo -e "    ${GREEN}secret sort${NC} [traffic|conns|date|name]  Sort secrets list"
     echo -e "    ${DIM}Tip: add/remove support --no-restart flag for scripting${NC}"
     echo ""
     echo -e "  ${BOLD}Upstream Routing:${NC}"
@@ -6084,6 +6437,7 @@ show_cli_help() {
     echo -e "    ${GREEN}traffic${NC}                 Show traffic stats"
     echo -e "    ${GREEN}connections${NC}             Show live active connections per user"
     echo -e "    ${GREEN}metrics${NC}                 Show live engine metrics (connections, upstream, users, ME)"
+    echo -e "    ${GREEN}doctor${NC}                  Comprehensive diagnostics (port, TLS, secrets, disk, bot)"
     echo -e "    ${GREEN}metrics live${NC} [seconds]  Auto-refresh metrics dashboard (default: 5s)"
     echo -e "    ${GREEN}logs${NC}                    Stream container logs"
     echo -e "    ${GREEN}health${NC}                  Run health diagnostics"
@@ -6520,6 +6874,18 @@ cli_main() {
                     check_root
                     secret_disable_expired
                     ;;
+                extend)
+                    check_root
+                    [ -z "$1" ] || [ -z "$2" ] && { log_error "Usage: mtproxymax secret extend <label> <days>"; return 1; }
+                    secret_extend "$1" "$2"
+                    ;;
+                stats)
+                    secret_stats
+                    ;;
+                sort)
+                    check_root
+                    secret_sort "${1:-traffic}"
+                    ;;
                 *)       log_error "Unknown: secret ${subcmd}"; show_cli_help; return 1 ;;
             esac
             ;;
@@ -6885,6 +7251,12 @@ cli_main() {
             load_settings
             load_secrets
             health_check
+            ;;
+
+        doctor)
+            load_settings
+            load_secrets
+            run_doctor
             ;;
 
         telegram)
