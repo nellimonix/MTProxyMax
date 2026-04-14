@@ -4400,7 +4400,14 @@ get_stats() {
 }
 
 get_uptime() {
-    local sa=$(docker inspect --format '{{.State.StartedAt}}' mtproxymax 2>/dev/null)
+    # Prefer Prometheus uptime metric (always available when engine is running)
+    local m; m=$(curl -s --max-time 2 "http://127.0.0.1:${PROXY_METRICS_PORT:-9090}/metrics" 2>/dev/null)
+    if [ -n "$m" ]; then
+        local up; up=$(echo "$m" | awk '/^telemt_uptime_seconds /{printf "%.0f",$NF}')
+        [ -n "$up" ] && [ "$up" -gt 0 ] 2>/dev/null && { echo "$up"; return; }
+    fi
+    # Fallback: docker inspect
+    local sa; sa=$(docker inspect --format '{{.State.StartedAt}}' mtproxymax 2>/dev/null)
     [ -z "$sa" ] && echo 0 && return
     local sa_clean="${sa%%.*}"
     [[ "$sa" == *Z ]] && sa_clean="${sa_clean}Z"
