@@ -6523,6 +6523,7 @@ show_cli_help() {
     echo -e "    ${GREEN}port${NC} [get|<number>]       Show or change proxy port"
     echo -e "    ${GREEN}ip${NC} [get|auto|<address>]   Show, reset, or set custom IP/domain for links"
     echo -e "    ${GREEN}domain${NC} [get|clear|<host>] Show, clear, or change FakeTLS domain"
+    echo -e "    ${GREEN}mask-backend${NC} [host:port]  Show or set mask backend for non-proxy traffic"
     echo -e "    ${GREEN}adtag${NC} [set <hex>|remove|view] Manage ad-tag"
     echo -e "    ${GREEN}geoblock${NC} [add|remove|list|clear] Manage geo-blocking"
     echo -e "    ${GREEN}sni-policy${NC} [mask|drop]       Unknown SNI action (mask=permissive, drop=strict)"
@@ -7125,6 +7126,30 @@ cli_main() {
                     fi
                     ;;
             esac
+            ;;
+
+        mask-backend)
+            load_settings
+            local _mh="${1:-}" _mp="${2:-}"
+            if [ -z "$_mh" ]; then
+                echo -e "  Mask backend: ${MASKING_HOST:-${PROXY_DOMAIN}}:${MASKING_PORT:-443}"
+                return
+            fi
+            check_root
+            load_secrets
+            # Support host:port format
+            if [[ "$_mh" == *:* ]] && [ -z "$_mp" ]; then
+                _mp="${_mh##*:}"; _mh="${_mh%%:*}"
+            fi
+            [ -n "$_mp" ] && { [[ "$_mp" =~ ^[0-9]+$ ]] && [ "$_mp" -ge 1 ] && [ "$_mp" -le 65535 ] || { log_error "Invalid port"; return 1; }; }
+            MASKING_HOST="$_mh"
+            [ -n "$_mp" ] && MASKING_PORT="$_mp"
+            save_settings
+            log_success "Mask backend set to ${MASKING_HOST}:${MASKING_PORT:-443}"
+            if is_proxy_running; then
+                load_secrets
+                restart_proxy_container
+            fi
             ;;
 
         adtag)
@@ -8151,7 +8176,7 @@ show_settings_menu() {
         echo -e "  ${BOLD}Domain:${NC}      ${PROXY_DOMAIN}"
         echo -e "  ${BOLD}CPU:${NC}         ${PROXY_CPUS:-unlimited}"
         echo -e "  ${BOLD}Memory:${NC}      ${PROXY_MEMORY:-unlimited}"
-        echo -e "  ${BOLD}Masking:${NC}     ${MASKING_ENABLED}"
+        echo -e "  ${BOLD}Masking:${NC}     ${MASKING_ENABLED}$([ "$MASKING_ENABLED" = "true" ] && echo " → ${MASKING_HOST:-${PROXY_DOMAIN}}:${MASKING_PORT:-443}")"
         echo -e "  ${BOLD}Ad-tag:${NC}      ${AD_TAG:-${DIM}not set${NC}}"
         echo -e "  ${BOLD}Auto-update:${NC} ${AUTO_UPDATE_ENABLED}"
         echo -e "  ${BOLD}PROXY proto:${NC} ${PROXY_PROTOCOL}$([ "$PROXY_PROTOCOL" = "true" ] && [ -n "$PROXY_PROTOCOL_TRUSTED_CIDRS" ] && echo " (trusted: ${PROXY_PROTOCOL_TRUSTED_CIDRS})")"
@@ -8162,6 +8187,7 @@ show_settings_menu() {
         echo -e "  ${DIM}[3]${NC} Change domain"
         echo -e "  ${DIM}[4]${NC} Change resources (CPU/RAM)"
         echo -e "  ${DIM}[5]${NC} Toggle traffic masking"
+        echo -e "  ${DIM}[m]${NC} Set mask backend (host:port for non-proxy traffic)"
         echo -e "  ${DIM}[6]${NC} Set ad-tag"
         echo -e "  ${DIM}[7]${NC} Toggle auto-update"
         echo -e "  ${DIM}[8]${NC} Toggle PROXY protocol"
@@ -8339,6 +8365,36 @@ show_settings_menu() {
                 press_any_key
                 ;;
             9) show_engine_menu ;;
+            m|M)
+                echo -e "  ${DIM}Non-proxy TLS traffic is forwarded to this backend.${NC}"
+                echo -e "  ${DIM}Current: ${MASKING_HOST:-${PROXY_DOMAIN}}:${MASKING_PORT:-443}${NC}"
+                echo ""
+                echo -en "  ${BOLD}Host [${MASKING_HOST:-${PROXY_DOMAIN}}]:${NC} "
+                local _mh; read -r _mh
+                echo -en "  ${BOLD}Port [${MASKING_PORT:-443}]:${NC} "
+                local _mp; read -r _mp
+                local _changed=false
+                if [ -n "$_mh" ]; then
+                    MASKING_HOST="$_mh"; _changed=true
+                fi
+                if [ -n "$_mp" ]; then
+                    if [[ "$_mp" =~ ^[0-9]+$ ]] && [ "$_mp" -ge 1 ] && [ "$_mp" -le 65535 ]; then
+                        MASKING_PORT="$_mp"; _changed=true
+                    else
+                        log_error "Invalid port"
+                    fi
+                fi
+                if $_changed; then
+                    save_settings
+                    log_success "Mask backend set to ${MASKING_HOST:-${PROXY_DOMAIN}}:${MASKING_PORT:-443}"
+                    if is_proxy_running; then
+                        echo -en "  ${DIM}Restart proxy to apply? [Y/n]:${NC} "
+                        local r; read -r r
+                        [[ ! "$r" =~ ^[nN] ]] && { load_secrets; restart_proxy_container || true; }
+                    fi
+                fi
+                press_any_key
+                ;;
             0|"") return ;;
             *) ;;
         esac
