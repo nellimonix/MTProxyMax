@@ -299,9 +299,9 @@ read_choice() {
     local default="${2:-}"
     # Drain any stale input (e.g., leftover escape-sequence bytes)
     read -rn 256 -t 0.05 _ 2>/dev/null || true
-    echo -en "\n  ${DIM}Enter ${prompt,,}${NC}" >&2
-    [ -n "$default" ] && echo -en " ${DIM}[${default}]${NC}" >&2
-    echo -en "${DIM}:${NC} " >&2
+    echo -en "\n  Enter ${prompt,,}" >&2
+    [ -n "$default" ] && echo -en " [${default}]" >&2
+    echo -en ": " >&2
     local choice
     read -r choice
     [ -z "$choice" ] && choice="$default"
@@ -3141,8 +3141,8 @@ upstream_list() {
     echo ""
     draw_header "UPSTREAMS"
     echo ""
-    printf "  ${BOLD}%-4s %-18s %-8s %-24s %-8s %-10s${NC}\n" "#" "NAME" "TYPE" "ADDRESS" "WEIGHT" "STATUS"
-    echo -e "  ${DIM}$(_repeat '─' 76)${NC}"
+    printf "  ${BOLD}%-4s %-18s %-8s %-28s %-8s %-10s${NC}\n" "#" "NAME" "TYPE" "ADDRESS" "WEIGHT" "STATUS"
+    echo -e "  ${DIM}$(_repeat '─' 80)${NC}"
 
     local i
     for i in "${!UPSTREAM_NAMES[@]}"; do
@@ -3152,19 +3152,21 @@ upstream_list() {
         local weight="${UPSTREAM_WEIGHTS[$i]}"
         local iface="${UPSTREAM_IFACES[$i]}"
         local enabled="${UPSTREAM_ENABLED[$i]}"
-        local status_icon addr_fmt
 
-        [ -z "$addr" ] && addr_fmt="${DIM}—${NC}" || addr_fmt="$addr"
-        [ -n "$iface" ] && addr_fmt="${addr_fmt} ${DIM}(${iface})${NC}"
+        local addr_plain
+        [ -z "$addr" ] && addr_plain="—" || addr_plain="$addr"
+        [ -n "$iface" ] && addr_plain="${addr_plain} (${iface})"
 
+        local status_str
         if [ "$enabled" = "true" ]; then
-            status_icon="${GREEN}${SYM_OK} active${NC}"
+            status_str="${GREEN}${SYM_OK} active${NC}"
         else
-            status_icon="${RED}${SYM_CROSS} disabled${NC}"
+            status_str="${RED}${SYM_CROSS} disabled${NC}"
         fi
 
-        printf "  %-4s %-18s %-8s %-24b %-8s %-10b\n" \
-            "$((i+1))" "$name" "$type" "$addr_fmt" "$weight" "$status_icon"
+        printf "  %-4s %-18s %-8s %-28s %-8s " \
+            "$((i+1))" "$name" "$type" "$addr_plain" "$weight"
+        echo -e "$status_str"
     done
     echo ""
 }
@@ -3982,6 +3984,12 @@ self_update() {
         if [ "$_local_hash" = "$_remote_hash" ]; then
             log_success "Script is already up to date (v${_new_ver:-${VERSION}})"
             rm -f "$_tmp" "$_UPDATE_BADGE"
+            # Update stored SHA so background check doesn't re-trigger the badge
+            local _new_sha
+            _new_sha=$(curl -fsSL --connect-timeout 5 --max-time 10 \
+                "https://api.github.com/repos/${GITHUB_REPO}/commits/main" \
+                -H "Accept: application/vnd.github.sha" 2>/dev/null) || true
+            [ -n "$_new_sha" ] && [ ${#_new_sha} -ge 40 ] && echo "${_new_sha:0:40}" > "$_UPDATE_SHA_FILE" 2>/dev/null || true
         else
             log_info "Update found: v${_new_ver:-?} (installed: v${VERSION})"
             echo -en "  ${BOLD}Update now? [y/N]:${NC} "
@@ -4457,7 +4465,14 @@ get_stats() {
 }
 
 get_uptime() {
-    local sa=$(docker inspect --format '{{.State.StartedAt}}' mtproxymax 2>/dev/null)
+    # Prefer Prometheus uptime metric (always available when engine is running)
+    local m; m=$(curl -s --max-time 2 "http://127.0.0.1:${PROXY_METRICS_PORT:-9090}/metrics" 2>/dev/null)
+    if [ -n "$m" ]; then
+        local up; up=$(echo "$m" | awk '/^telemt_uptime_seconds /{printf "%.0f",$NF}')
+        [ -n "$up" ] && [ "$up" -gt 0 ] 2>/dev/null && { echo "$up"; return; }
+    fi
+    # Fallback: docker inspect
+    local sa; sa=$(docker inspect --format '{{.State.StartedAt}}' mtproxymax 2>/dev/null)
     [ -z "$sa" ] && echo 0 && return
     local sa_clean="${sa%%.*}"
     [[ "$sa" == *Z ]] && sa_clean="${sa_clean}Z"
