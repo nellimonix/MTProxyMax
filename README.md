@@ -42,7 +42,7 @@
   <p align="center"><b>The Ultimate Telegram MTProto Proxy Manager</b></p>
   <p align="center">One script. Full control. Zero hassle.</p>
   <p align="center">
-    <img src="https://img.shields.io/badge/version-1.0.5-brightgreen" alt="Version"/>
+    <img src="https://img.shields.io/badge/version-1.0.6-brightgreen" alt="Version"/>
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="License"/>
     <img src="https://img.shields.io/badge/engine-Rust_(telemt_3.x)-orange" alt="Engine"/>
     <img src="https://img.shields.io/badge/platform-Linux-lightgrey" alt="Platform"/>
@@ -175,8 +175,31 @@ For the full CLI reference (proxy management, replication, upstreams, geoblock, 
 - New TUI entry **[9] Change secret key** under Secret Management
 - Hot-reload on key change via `SIGHUP` (no dropped connections); duplicate-key detection; `ee`/`dd`-prefix and domain-hex auto-stripping
 
-### v1.0.5 — Clone, Bulk-Extend, Doctor, Stats & More
+### v1.0.6 — Profiles, Archive, Search, Info, Port Check & More
 
+- `secret info <label>` — full detail view (limits, live traffic, link, QR)
+- `secret search <query>` — find secrets by partial label or notes
+- `secret archive/unarchive` — soft-delete and restore secrets
+- `secret top [traffic|conns]` — top N users at a glance
+- `secret generate-links [txt|html]` — bulk export links with QR codes
+- `config` — display current engine config
+- `uptime` — one-line scriptable output for monitoring
+- `notify <message>` — send custom Telegram notification
+- `port-check` — test if proxy port is reachable from outside
+- `profile save|load|list|delete` — named config snapshots
+- `mask-backend [host:port]` — set mask backend from CLI/TUI ([#71](https://github.com/SamNet-dev/MTProxyMax/issues/71))
+- Metrics bound to 127.0.0.1 only ([#65](https://github.com/SamNet-dev/MTProxyMax/issues/65))
+- Fix domain change exit in non-TTY ([#64](https://github.com/SamNet-dev/MTProxyMax/pull/64))
+- Fix empty label in non-TTY secret add/remove ([#66](https://github.com/SamNet-dev/MTProxyMax/issues/66))
+- Fix upstream table column alignment ([#67](https://github.com/SamNet-dev/MTProxyMax/issues/67))
+- Fix false "Update available" badge ([#68](https://github.com/SamNet-dev/MTProxyMax/issues/68))
+- Fix invisible "Enter choice" prompt ([#69](https://github.com/SamNet-dev/MTProxyMax/issues/69))
+- Fix bot uptime always 0m ([#70](https://github.com/SamNet-dev/MTProxyMax/issues/70))
+- Telegram bot: instant response, no temp files ([#62](https://github.com/SamNet-dev/MTProxyMax/issues/62))
+
+### v1.0.5 — Engine v3.4.0, Clone, Bulk-Extend, Doctor, Stats & More
+
+- Engine v3.4.0 — mask relay timeouts (anti slow-loris), RST-on-close for scanners, single-endpoint DC recovery fix
 - `secret clone <src> <new>` — duplicate a secret with all its limits
 - `secret bulk-extend <days>` — extend all secrets' expiry at once
 - `secret extend <label> <days>` — extend a single secret's expiry
@@ -184,8 +207,9 @@ For the full CLI reference (proxy management, replication, upstreams, geoblock, 
 - `connections` — live active connections per user
 - `doctor` — comprehensive diagnostics (port, TLS, secrets, disk, Telegram bot)
 - Auto-rotate secrets on domain change, startup warnings for expired/near-expiry secrets
-- QR code shown inline after `secret add` (if qrencode installed)
-- Fedora 41+ Docker install fix (dnf5 `--addrepo`, Fedora repo URL)
+- Telegram bot: instant response (long-polling), single awk pass, no temp files
+- Metrics bound to localhost only ([#65](https://github.com/SamNet-dev/MTProxyMax/issues/65))
+- Fedora 41+ Docker install fix ([#61](https://github.com/SamNet-dev/MTProxyMax/issues/61))
 
 ### v1.0.4 — Replication, Engine v3.3.39, Metrics Dashboard
 
